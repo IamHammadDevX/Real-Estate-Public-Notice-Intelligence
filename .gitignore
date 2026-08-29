@@ -1,0 +1,78 @@
+# Python bytecode and virtual environments
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.Python
+venv/
+.venv/
+env/
+ENV/
+site/
+.eggs/
+*.egg-info/
+build/
+dist/
+*.egg
+pip-wheel-metadata/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+.coverage.*
+htmlcov/
+
+# Environment and secrets
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+*.crt
+
+# IDE and editor files
+.vscode/
+.idea/
+*.swp
+*.swo
+*.tmp
+*.bak
+*.orig
+
+# OS generated files
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# Browser automation and runtime artifacts
+playwright-report/
+test-results/
+.browser/
+.auth/
+user_data/
+chromium-data/
+*.log
+
+# Local data and exports
+exports/
+input_propstream_*.csv
+
+# Databases
+*.db
+*.sqlite
+*.sqlite3
+
+# Archives
+*.zip
+*.tar
+*.gz
+*.7z
+
+# Temporary folders
+/tmp/
+temp/
+tmp/
+
+# Project-specific local scripts that are not meant for repo publishing
+*.bat
+*.cmd

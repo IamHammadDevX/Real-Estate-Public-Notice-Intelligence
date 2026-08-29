@@ -1,0 +1,8 @@
+mysql-connector-python
+anticaptchaofficial
+selenium
+pandas
+beautifulsoup4
+python-dotenv
+openai
+undetected-chromedriver

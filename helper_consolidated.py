@@ -12,7 +12,7 @@ import time
 import stat
 import tempfile
 import shutil
-from datetime import datetime
+from datetime import datetime, timedelta
 from dotenv import load_dotenv
 from openai import OpenAI
 import csv
@@ -164,6 +164,35 @@ def time_elapsed_str(start, end):
         miliseconds = mili[1:]
         strings += miliseconds
     return strings
+
+
+def print_progress(state, stage, processed, total, started, succeeded=None):
+    """Emit one grep-friendly progress line with elapsed time and ETA."""
+    elapsed = max(0.001, time.time() - started)
+    processed = max(0, int(processed))
+    total = max(0, int(total))
+    remaining = max(0, total - processed)
+    eta_seconds = (elapsed / processed) * remaining if processed else 0
+    percent = (processed / total * 100.0) if total else 100.0
+    finish_at = datetime.now() + timedelta(seconds=eta_seconds)
+    parts = [
+        "PROGRESS",
+        "state={}".format(state),
+        "stage={}".format(stage),
+        "processed={}".format(processed),
+        "total={}".format(total),
+        "percent={:.1f}".format(percent),
+    ]
+    if succeeded is not None:
+        parts.append("succeeded={}".format(succeeded))
+    parts.extend(
+        [
+            "elapsed={}".format(time_elapsed_str(0, elapsed)),
+            "eta={}".format(time_elapsed_str(0, eta_seconds)),
+            "finish_at={}".format(finish_at.strftime("%Y-%m-%d_%H:%M:%S")),
+        ]
+    )
+    print_log(" ".join(parts))
 
 
 def call_chatgpt(text):
@@ -1115,11 +1144,17 @@ def get_data(page, database, state_name):
     return page, web_scrape
 
 
-def get_all_pages(page, pagers, database, state, site_url=None):
+def get_all_pages(
+    page, pagers, database, state, site_url=None, return_failures=False
+):
     if site_url is None:
         site_url = "https://www.ncnotices.com/" if state == "NC" else "https://www.georgiapublicnotice.com/"
     print_log("Page Loaded...")
     all_records = []
+    failures = []
+    total_notices = len(pagers)
+    processed_notices = 0
+    progress_started = time.time()
     page_map = {}
     for pager in pagers:
         page_number, row_id = pager.split("_", 1)
@@ -1127,7 +1162,8 @@ def get_all_pages(page, pagers, database, state, site_url=None):
 
     if not page_map:
         print_log("No notice buttons were selected.", True)
-        return page, all_records
+        result = (page, all_records, failures)
+        return result if return_failures else result[:2]
 
     inc = 1
     for page_number in sorted(page_map):
@@ -1139,6 +1175,19 @@ def get_all_pages(page, pagers, database, state, site_url=None):
                     page_number, error
                 ),
                 True,
+            )
+            failures.extend(
+                "{}_{}".format(page_number, row_id)
+                for row_id in page_map[page_number]
+            )
+            processed_notices += len(page_map[page_number])
+            print_progress(
+                state,
+                "notices",
+                processed_notices,
+                total_notices,
+                progress_started,
+                len(all_records),
             )
             inc += len(page_map[page_number])
             continue
@@ -1191,15 +1240,26 @@ def get_all_pages(page, pagers, database, state, site_url=None):
                         )
 
             if not saved:
+                failures.append("{}_{}".format(page_number, id_val))
                 print_log(
                     "Notice {} skipped after {} attempts; continuing run.".format(
                         inc, NOTICE_RETRIES
                     ),
                     True,
                 )
+            processed_notices += 1
+            print_progress(
+                state,
+                "notices",
+                processed_notices,
+                total_notices,
+                progress_started,
+                len(all_records),
+            )
             inc += 1
 
-    return page, all_records
+    result = (page, all_records, failures)
+    return result if return_failures else result[:2]
 
 
 # ---- Propstream / Truthfinder helpers (ported from Selenium to Playwright) ----

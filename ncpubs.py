@@ -17,6 +17,7 @@ load_dotenv()
 dev = util.dev
 
 def main(limit=None):
+    strict_run = util._env_flag("STRICT_RUN")
     util.print_log("--Starts--")
     starts = time.time()
     site_link = "https://www.ncnotices.com/"
@@ -32,6 +33,8 @@ def main(limit=None):
     except Exception as e:
         util.print_log("{}: {}".format(type(e).__name__, e), True)
         util.print_log("Unable to initialize webdriver", True)
+        if strict_run:
+            raise
         return
 
     all_pages = util.evaluate_pages_to_work(page, limit)
@@ -45,18 +48,27 @@ def main(limit=None):
         db = Mysql(dev)
     except Exception as e:
         util.print_log(f"Database connection failed — proceeding without DB: {e}", True)
+        if strict_run:
+            browser.close()
+            raise RuntimeError("Database is required for strict server run") from e
 
     # ── Phase 2: Scrape all notices ───────────────────────────────────────────────
     scraped_records = []
+    scrape_failures = []
+    scrape_error = None
     try:
-        page, scraped_records = util.get_all_pages(page, notice_data, db, state)
+        page, scraped_records, scrape_failures = util.get_all_pages(
+            page, notice_data, db, state, return_failures=True
+        )
     except Exception as e:
         util.print_log(f"get_all_pages failed: {e}", True)
+        scrape_error = e
 
     util.print_log(f"\nScraped {len(scraped_records)} notices. Starting Propstream enrichment...")
 
     # ── Phase 3: Propstream login & lookup ───────────────────────────────────────
     propstream_results = {}  # notice Id -> list of propstream dicts
+    propstream_failures = []
     parse_propstream, propstream_session = util.login_propstream(page)
 
     if parse_propstream:
@@ -65,6 +77,7 @@ def main(limit=None):
         if skipped:
             util.print_log(f"Skipped {skipped} P.O. Box / incomplete-address records (not searchable in Propstream)")
 
+        propstream_started = time.time()
         for count, rec in enumerate(usable, start=1):
             msg = "\nPropstream {} / {} — {}".format(count, len(usable), rec.get('Street', ''))
             util.print_log(msg)
@@ -74,12 +87,24 @@ def main(limit=None):
                     propstream_results[str(rec.get('Id', ''))] = props
             except Exception as e:
                 util.print_log(f"Propstream lookup failed for {rec.get('Street', '')}: {e}", True)
+            if rec.get("propstream_info") not in ("Y", "N"):
+                propstream_failures.append(str(rec.get("Id", "")))
 
             n = random.randint(2, 5)
             util.print_log(f"Waiting {n} seconds")
             time.sleep(n)
+            util.print_progress(
+                state,
+                "propstream",
+                count,
+                len(usable),
+                propstream_started,
+                count - len(propstream_failures),
+            )
     else:
         util.print_log("Propstream login failed — combined file will have scraping data only.", True)
+        if strict_run:
+            propstream_failures.append("LOGIN")
 
     if db is not None:
         try:
@@ -154,6 +179,13 @@ def main(limit=None):
     ends = time.time()
     util.print_log("--Finish--")
     util.print_log(util.time_elapsed_str(starts, ends))
+    if strict_run and (scrape_error or scrape_failures or propstream_failures):
+        raise RuntimeError(
+            "Incomplete NC run: scrape_error={}, failed_notices={}, "
+            "failed_propstream={}".format(
+                bool(scrape_error), len(scrape_failures), len(propstream_failures)
+            )
+        )
 
 
 if __name__ == '__main__':

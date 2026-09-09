@@ -1,0 +1,20 @@
+[Unit]
+Description=GA and NC foreclosure full scraper
+Wants=network-online.target
+After=network-online.target
+StartLimitIntervalSec=0
+ConditionPathExists=!/opt/foreclosure-scraper/state/full_scrape.complete
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=/opt/foreclosure-scraper
+ExecStart=/bin/bash /opt/foreclosure-scraper/run_full_scrape.sh
+Restart=on-failure
+RestartSec=60
+TimeoutStartSec=infinity
+TimeoutStopSec=120
+KillSignal=SIGINT
+
+[Install]
+WantedBy=multi-user.target

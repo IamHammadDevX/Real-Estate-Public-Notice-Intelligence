@@ -52,6 +52,7 @@ test-results/
 user_data/
 chromium-data/
 *.log
+graphify-out/*
 
 # Local data and exports
 exports/

@@ -6,3 +6,8 @@ beautifulsoup4
 python-dotenv
 openai
 undetected-chromedriver
+playwright
+requests
+openpyxl
+webdriver-manager
+pypdf

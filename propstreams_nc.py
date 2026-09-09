@@ -14,7 +14,7 @@ from db_file import Mysql
 import helper_consolidated as util
 
 load_dotenv()
-dev = bool(os.environ.get("DEV_MODE"))
+dev = util.dev
 
 def main():
     util.print_log("--Starts--")
@@ -157,7 +157,10 @@ def main():
         ts = util.FALLBACK_RUN_ID
         csv_path = os.path.join(out_dir, f'propstream_nc_{ts}.csv')
         with open(csv_path, 'w', newline='', encoding='utf-8') as fh:
-            writer = __import__('csv').DictWriter(fh, fieldnames=sorted(results[0].keys()))
+            fieldnames = sorted({key for result in results for key in result})
+            writer = __import__('csv').DictWriter(
+                fh, fieldnames=fieldnames, extrasaction='ignore'
+            )
             writer.writeheader()
             for r in results:
                 writer.writerow(r)
@@ -171,7 +174,7 @@ def main():
             df.to_excel(xlsx_path, index=False)
             # Make the 'url' column clickable hyperlinks
             if 'url' in df.columns:
-                url_col_idx = sorted(results[0].keys()).index('url') + 1  # 1-based
+                url_col_idx = list(df.columns).index('url') + 1  # 1-based
                 wb = load_workbook(xlsx_path)
                 ws = wb.active
                 for row in ws.iter_rows(min_row=2, min_col=url_col_idx, max_col=url_col_idx):

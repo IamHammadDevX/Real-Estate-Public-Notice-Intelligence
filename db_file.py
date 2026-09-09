@@ -11,25 +11,25 @@ from dotenv import load_dotenv
 import os
 import random
 import time
+import re
 
 load_dotenv()
 class Mysql:
+    DISCONNECT_ERROR_CODES = {2006, 2013, 2014, 2045, 2055, 4031}
+
     def __init__(self, dev=True):
         self.dev = dev
-        db_base = os.environ.get("DATABASE_NAME")
-        config = {
-            'host': os.environ.get("DATABASE_HOST"),
-            'user': os.environ.get("DATABASE_USER"),
-            'password': os.environ.get("DATABASE_PASSWORD"),
+        db_base = os.environ.get("DATABASE_NAME") or os.environ.get("DB_NAME")
+        self.config = {
+            'host': os.environ.get("DATABASE_HOST") or os.environ.get("DB_HOST"),
+            'user': os.environ.get("DATABASE_USER") or os.environ.get("DB_USER"),
+            'password': os.environ.get("DATABASE_PASSWORD") or os.environ.get("DB_PASSWORD"),
             'database': db_base
         }
-
-        self.connection = mysql.connector.connect(**config)
-        if self.connection.is_connected():
-            self.cursor = self.connection.cursor()
-            self.print_log("Database Connected: '{}'".format(db_base))
-        else:
-            self.print_log("Unable to Connect: '{}'".format(db_base))
+        self.connection = None
+        self.cursor = None
+        self.reconnect(force=True)
+        self.print_log("Database Connected: '{}'".format(db_base))
 
     def print_log(self, text, error=False):
         dev = self.dev
@@ -42,44 +42,99 @@ class Mysql:
                 logging.info(text.strip())
 
     def show_data(self, name, extra=False):
-        stmt = 'SELECT * FROM {}'.format(name)
+        stmt = 'SELECT * FROM {}'.format(self._quote_identifier(name))
         if extra:
             if isinstance(extra, list):
                 columns = extra.copy()
-                column_str = ", ".join(columns)
-                stmt = 'SELECT {} FROM {}'.format(column_str, name)
+                column_str = ", ".join(self._quote_identifier(column) for column in columns)
+                stmt = 'SELECT {} FROM {}'.format(column_str, self._quote_identifier(name))
             elif isinstance(extra, str):
                 stmt = extra.strip()
 
-        self.cursor.execute(stmt)
-        rows = self.cursor.fetchall()
+        rows = self._execute(stmt, fetch="all")
         for row in rows:
             yield row
 
     def get_count(self, name, max_column=False):
-        stmt = 'SELECT COUNT(1) FROM {}'.format(name)
+        source_sql = name.strip() if str(name).strip().startswith('(') else self._quote_identifier(name)
+        stmt = 'SELECT COUNT(1) FROM {}'.format(source_sql)
         if max_column:
-            stmt = 'SELECT MAX({}) FROM {}'.format(max_column, name)
-        self.cursor.execute(stmt)
-        rows = self.cursor.fetchall()
-        return rows[0][0]
+            stmt = 'SELECT MAX({}) FROM {}'.format(
+                self._quote_identifier(max_column), self._quote_identifier(name)
+            )
+        row = self._execute(stmt, fetch="one")
+        return row[0]
 
-    def run_query(self, query):
-        self.reconnect()
-        self.cursor.execute(query)
-        self.cursor.execute("COMMIT")
+    @staticmethod
+    def _quote_identifier(value):
+        value = str(value)
+        if not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", value):
+            raise ValueError("Unsafe SQL identifier: {!r}".format(value))
+        return "`{}`".format(value)
+
+    @classmethod
+    def _is_disconnect_error(cls, error):
+        return getattr(error, "errno", None) in cls.DISCONNECT_ERROR_CODES
+
+    def _execute(self, query, params=None, fetch=None, commit=False):
+        """Execute one statement, reconnecting first and retrying once on disconnect."""
+        params = () if params is None else params
+        for attempt in range(2):
+            try:
+                self.reconnect()
+                self.cursor.execute(query, params)
+                rowcount = self.cursor.rowcount
+                if fetch == "one":
+                    result = self.cursor.fetchone()
+                elif fetch == "all":
+                    result = self.cursor.fetchall()
+                else:
+                    result = rowcount
+                if commit:
+                    self.connection.commit()
+                return result
+            except Exception as error:
+                if attempt == 0 and self._is_disconnect_error(error):
+                    self.print_log(
+                        "MySQL disconnected ({}); reconnecting and retrying once.".format(
+                            getattr(error, "errno", "unknown")
+                        ),
+                        True,
+                    )
+                    self.reconnect(force=True)
+                    continue
+                raise
+
+    def run_query(self, query, params=None):
+        return self._execute(query, params=params, commit=True)
+
+    def fetch_all(self, query, params=None):
+        rows = self._execute(query, params=params, fetch="all")
+        return tuple(self.cursor.column_names), rows
 
     def Close_db(self):
-        if self.connection.is_connected():
-            self.cursor.close()
+        if self.connection is not None and self.connection.is_connected():
+            if self.cursor is not None:
+                self.cursor.close()
             self.connection.close()
             self.print_log("Database Connection Close.")
 
-    def reconnect(self):
+    def reconnect(self, force=False):
         try:
-            if not self.connection.is_connected():
+            connected = self.connection is not None and self.connection.is_connected()
+            if force or not connected:
                 self.print_log("Connection lost. Reconnecting...", True)
-                self.connection.reconnect(attempts=3, delay=5)
+                try:
+                    if self.cursor is not None:
+                        self.cursor.close()
+                except Exception:
+                    pass
+                try:
+                    if self.connection is not None:
+                        self.connection.close()
+                except Exception:
+                    pass
+                self.connection = mysql.connector.connect(**self.config)
                 self.cursor = self.connection.cursor()
                 self.print_log("Reconnected to MySQL server.")
         except Exception as e:
@@ -89,154 +144,144 @@ class Mysql:
             raise
 
     def pub_data(self, data, table_name):
-        data = {
-            **data,
-            'table_name': table_name
-        }
-        key_list = list(data.keys())
-        val_list = list()
-        for value in data.values():
-            if type(value) == str:
-                value = value.replace('\'', '')
-                values = f"'{value}'"
-                val_list.append(values)
-            else:
-                if not bool(value):
-                    values = "-1"
-                    val_list.append(values)
-                else:
-                    values = f"{value}"
-                    val_list.append(values)
-
-        street, city = data['Street'], data['City']
-        query = None
-        address = False
-        if bool(street) and bool(city):
-            query = "SELECT COUNT(1) FROM `{table_name}` WHERE `Street` = '{Street}' AND `City` = '{City}'".format_map(data)
-            address = True
+        data = dict(data)
+        table_sql = self._quote_identifier(table_name)
+        if data.get('Id') not in (None, ''):
+            where_sql = "`Id` = %s"
+            where_params = (data['Id'],)
+            immutable = {'Id'}
+        elif data.get('Street') and data.get('City'):
+            where_sql = "`Street` = %s AND `City` = %s"
+            where_params = (data['Street'], data['City'])
+            immutable = {'Street', 'City'}
         else:
-            query = "SELECT COUNT(1) FROM `{table_name}` WHERE `Notice` = '{Notice}'".format_map(data)
-        self.cursor.execute(query)
-        rows = self.cursor.fetchall()
-        if bool(rows[0][0]):
-            set_equal = list()
-            skip_columns = ['table_name']
-            if bool(address):
-                skip_columns.extend(['Street', 'City'])
-            else:
-                skip_columns.append('Notice')
-            for column, values in zip(key_list, val_list):
-                if column in skip_columns:
-                    continue
-                sets = "{} = {}".format(column, values)
-                set_equal.append(sets)
-            equals = ", ".join(set_equal)
-
-            where_clause = None
-            if address:
-                where_clause = "`Street` = '{Street}' AND `City` = '{City}'".format_map(data)
-            else:
-                where_clause = "`Notice` = '{Notice}'".format_map(data)
-
-            stmt = """UPDATE `{}` SET {} WHERE {}""".format(table_name, equals, where_clause)
-        else:
-            key_list.remove('table_name')
-            val_list.remove("'{}'".format(table_name))
-            columns_str = "`, `".join(key_list)
-            values = ", ".join(val_list)
-
-            stmt = "INSERT INTO `{}` (`{}`) VALUES ({})".format(table_name, columns_str, values)
-
+            where_sql = "`Notice` = %s"
+            where_params = (data.get('Notice', ''),)
+            immutable = {'Notice'}
         try:
-            self.run_query(stmt)
-            if stmt.startswith("UPDATE"):
+            row = self._execute(
+                "SELECT COUNT(1) FROM {} WHERE {}".format(table_sql, where_sql),
+                where_params,
+                fetch="one",
+            )
+            if row and row[0]:
+                update_columns = [key for key in data if key not in immutable]
+                assignments = ", ".join(
+                    "{} = %s".format(self._quote_identifier(key)) for key in update_columns
+                )
+                params = tuple(data[key] for key in update_columns) + where_params
+                self.run_query(
+                    "UPDATE {} SET {} WHERE {}".format(table_sql, assignments, where_sql),
+                    params,
+                )
                 self.print_log("\nData Updated: '{}'".format(data['Id']))
             else:
+                columns = list(data)
+                column_sql = ", ".join(self._quote_identifier(key) for key in columns)
+                placeholders = ", ".join(["%s"] * len(columns))
+                self.run_query(
+                    "INSERT INTO {} ({}) VALUES ({})".format(
+                        table_sql, column_sql, placeholders
+                    ),
+                    tuple(data[key] for key in columns),
+                )
                 self.print_log("\nData Inserted: '{}'".format(data['Id']))
+            return True
         except Exception as e:
             error_str = "{}: {}".format(str(type(e).__name__), str(e))
-            error_sql = "SQL: '{}'".format(stmt)
             self.print_log(error_str, True)
-            self.print_log(error_sql, True)
+            raise
 
     def propstreams(self, table_name, data):
-        data = {
-            **data,
-            'table_name': table_name
-        }
-
-        key_list = list(data.keys())
-        val_list = list()
-        for value in data.values():
-            if type(value) == str:
-                value = value.replace('\'', '')
-                values = f"'{value}'"
-                val_list.append(values)
-            else:
-                values = f"{value}"
-                val_list.append(values)
-
-        query = "SELECT COUNT(1) FROM `{table_name}` WHERE `address_db` = '{address_db}';".format_map(data)
-        self.cursor.execute(query)
-        rows = self.cursor.fetchall()
-        if bool(rows[0][0]):
-            set_equal = list()
-            skip_columns = ['table_name']
-            for column, values in zip(key_list, val_list):
-                if column in skip_columns:
-                    continue
-                sets = "{} = {}".format(column, values)
-                set_equal.append(sets)
-            equals = ", ".join(set_equal)
-
-            where_clause = "`address_db` = '{address_db}'".format_map(data)
-            stmt = """UPDATE `{}` SET {} WHERE {}""".format(table_name, equals, where_clause)
-        else:
-            key_list.remove('table_name')
-            val_list.remove("'{}'".format(table_name))
-
-            columns_str = "`, `".join(key_list)
-            values = ", ".join(val_list)
-            stmt = "INSERT INTO `{}` (`{}`) VALUES ({})".format(table_name, columns_str, values)
-
+        data = dict(data)
+        table_sql = self._quote_identifier(table_name)
+        address = data.get('address_db', '')
         try:
-            self.run_query(stmt)
-            if stmt.startswith("UPDATE"):
+            row = self._execute(
+                "SELECT COUNT(1) FROM {} WHERE `address_db` = %s".format(table_sql),
+                (address,),
+                fetch="one",
+            )
+            if row and row[0]:
+                columns = [key for key in data if key != 'address_db']
+                assignments = ", ".join(
+                    "{} = %s".format(self._quote_identifier(key)) for key in columns
+                )
+                params = tuple(data[key] for key in columns) + (address,)
+                self.run_query(
+                    "UPDATE {} SET {} WHERE `address_db` = %s".format(
+                        table_sql, assignments
+                    ),
+                    params,
+                )
                 self.print_log("Data Updated: '{}'".format(data['address_db']))
             else:
+                columns = list(data)
+                column_sql = ", ".join(self._quote_identifier(key) for key in columns)
+                placeholders = ", ".join(["%s"] * len(columns))
+                self.run_query(
+                    "INSERT INTO {} ({}) VALUES ({})".format(
+                        table_sql, column_sql, placeholders
+                    ),
+                    tuple(data[key] for key in columns),
+                )
                 self.print_log("Data Inserted: '{}'".format(data['address_db']))
+            return True
         except Exception as e:
             error_str = "{}: {}".format(str(type(e).__name__), str(e))
-            error_sql = "SQL: '{}'".format(stmt)
             self.print_log(error_str, True)
-            self.print_log(error_sql, True)
+            raise
+
+    def set_propstream_info(self, table_name, notice_id, value):
+        if table_name not in {'GaPub', 'NcPub'}:
+            raise ValueError("Unsupported notice table: {}".format(table_name))
+        if value not in {'Y', 'N', None}:
+            raise ValueError("propstream_info must be Y, N, or None")
+        table_sql = self._quote_identifier(table_name)
+        row = self._execute(
+            "SELECT COUNT(1) FROM {} WHERE `Id` = %s".format(table_sql),
+            (notice_id,),
+            fetch="one",
+        )
+        if not row or not row[0]:
+            self.print_log(
+                "PropStream tag {} not saved: notice {} missing from {}.".format(
+                    value, notice_id, table_name
+                ),
+                True,
+            )
+            return False
+        affected = self.run_query(
+            "UPDATE {} SET `propstream_info` = %s WHERE `Id` = %s".format(
+                table_sql
+            ),
+            (value, notice_id),
+        )
+        self.print_log(
+            "PropStream tag {} saved for {} in {} (affected rows: {}).".format(
+                value, notice_id, table_name, affected
+            )
+        )
+        return True
 
     def truthfinder(self, table_name, array):
         parse_once = True
+        table_sql = self._quote_identifier(table_name)
         for i, data in enumerate(array, start=1):
-            data = {
-                **data,
-                'table_name': table_name
-            }
-            key_list = list(data.keys())
-            val_list = list()
-            for value in data.values():
-                if type(value) == str:
-                    value = value.replace('\'', '')
-                    values = f"'{value}'"
-                    val_list.append(values)
-                else:
-                    values = f"{value}"
-                    val_list.append(values)
-
+            data = dict(data)
+            address = data.get('address_db', '')
             if parse_once:
-                query = "SELECT COUNT(1) FROM `{table_name}` WHERE `address_db` = '{address_db}'".format_map(data)
-                self.cursor.execute(query)
-                rows = self.cursor.fetchall()
-                if bool(rows[0][0]):
-                    stmt_del = "DELETE FROM `{table_name}` WHERE `address_db` = '{address_db}'".format_map(data)
+                row = self._execute(
+                    "SELECT COUNT(1) FROM {} WHERE `address_db` = %s".format(table_sql),
+                    (address,),
+                    fetch="one",
+                )
+                if row and row[0]:
                     try:
-                        self.run_query(stmt_del)
+                        self.run_query(
+                            "DELETE FROM {} WHERE `address_db` = %s".format(table_sql),
+                            (address,),
+                        )
                         v = random.randint(2, 3)
                         time.sleep(v)
                     except Exception as e:
@@ -244,23 +289,19 @@ class Mysql:
                         self.print_log(error_str, True)
                 parse_once = False
 
-            key_list.remove('table_name')
-            val_list.remove("'{}'".format(table_name))
-
-            columns_str = "`, `".join(key_list)
-            values = ", ".join(val_list)
-            stmt = "INSERT INTO `{}` (`{}`) VALUES ({})".format(table_name, columns_str, values)
+            columns = list(data)
+            columns_sql = ", ".join(self._quote_identifier(key) for key in columns)
+            placeholders = ", ".join(["%s"] * len(columns))
+            stmt = "INSERT INTO {} ({}) VALUES ({})".format(
+                table_sql, columns_sql, placeholders
+            )
             try:
-                self.run_query(stmt)
-                if stmt.startswith("UPDATE"):
-                    self.print_log("Data Updated: '{}'".format(data['name']))
-                else:
-                    self.print_log("Data Inserted: '{}'".format(data['name']))
+                self.run_query(stmt, tuple(data[key] for key in columns))
+                self.print_log("Data Inserted: '{}'".format(data['name']))
             except Exception as e:
                 error_str = "{}: {}".format(str(type(e).__name__), str(e))
-                error_sql = "SQL: '{}'".format(stmt)
                 self.print_log(error_str, True)
-                self.print_log(error_sql, True)
+                raise
 
             v = random.randint(2, 3)
             self.print_log("\tWaiting {} seconds for another query...".format(v))

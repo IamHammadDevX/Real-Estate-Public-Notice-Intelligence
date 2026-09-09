@@ -6,7 +6,6 @@ Produces one CSV + XLSX per run: exports/GaCombined_<timestamp>.csv/xlsx
 
 import time
 import os
-import re
 import random
 import csv
 from dotenv import load_dotenv
@@ -15,10 +14,7 @@ import helper_consolidated as util
 from db_file import Mysql
 
 load_dotenv()
-dev = bool(os.environ.get("DEV_MODE"))
-
-_po_box = re.compile(r'^\s*(P\.?O\.?\s*Box|Post\s*Office\s*Box)', re.IGNORECASE)
-
+dev = util.dev
 
 def main(limit=None):
     util.print_log("--Starts--")
@@ -38,7 +34,7 @@ def main(limit=None):
         util.print_log("Unable to initialize webdriver", True)
         return
 
-    all_pages = util.evaluate_pages_to_work(page)
+    all_pages = util.evaluate_pages_to_work(page, limit)
     notice_data = all_pages[:limit] if limit else all_pages.copy()
 
     util.print_log('\n\nLoading: "{}"'.format(site_link))
@@ -64,10 +60,10 @@ def main(limit=None):
     parse_propstream, propstream_session = util.login_propstream(page)
 
     if parse_propstream:
-        usable = [r for r in scraped_records if r.get('Street') and not _po_box.match(r.get('Street', ''))]
+        usable = [r for r in scraped_records if util.is_propstream_eligible(r)]
         skipped = len(scraped_records) - len(usable)
         if skipped:
-            util.print_log(f"Skipped {skipped} P.O. Box / blank-address records (not searchable in Propstream)")
+            util.print_log(f"Skipped {skipped} P.O. Box / incomplete-address records (not searchable in Propstream)")
 
         for count, rec in enumerate(usable, start=1):
             msg = "\nPropstream {} / {} — {}".format(count, len(usable), rec.get('Street', ''))

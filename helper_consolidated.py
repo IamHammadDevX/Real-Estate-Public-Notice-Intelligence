@@ -16,8 +16,12 @@ from datetime import datetime
 from dotenv import load_dotenv
 from openai import OpenAI
 import csv
+import io
 import pathlib
 import requests
+import re
+from urllib.parse import urljoin
+from pypdf import PdfReader
 
 
 try:
@@ -44,10 +48,22 @@ except Exception:
 
 load_dotenv()
 
-dev = bool(os.environ.get("DEV_MODE"))
-FAST_MODE = os.environ.get("FAST_MODE", "1" if not dev else "0") in ["1", "True", "true", "yes"]
+def _env_flag(name, default=False):
+    raw = os.environ.get(name)
+    if raw is None:
+        return bool(default)
+    return raw.strip().lower() in {"1", "true", "yes", "on"}
+
+
+dev = _env_flag("DEV_MODE")
+FAST_MODE = _env_flag("FAST_MODE", not dev)
+HEADLESS = _env_flag("HEADLESS", not dev)
 # sleep scaling (set SLEEP_SCALE in env to override). Default is very small to speed scraping.
 SLEEP_SCALE = float(os.environ.get("SLEEP_SCALE", "0.05" if FAST_MODE else "1.0"))
+GRID_TIMEOUT_MS = int(os.environ.get("GRID_TIMEOUT_MS", "90000"))
+NAVIGATION_RETRIES = max(1, int(os.environ.get("NAVIGATION_RETRIES", "3")))
+NOTICE_RETRIES = max(1, int(os.environ.get("NOTICE_RETRIES", "2")))
+PDF_TEXT_LIMIT = max(1000, int(os.environ.get("PDF_TEXT_LIMIT", "50000")))
 
 USER_AGENT = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
@@ -68,21 +84,58 @@ def _ensure_exports_dir():
 
 
 def _save_record_to_csv(data, table_name):
-    """Append a dict record to a per-run CSV file for table_name."""
+    """Upsert one fallback row while keeping a stable, unioned CSV schema."""
     exports = _ensure_exports_dir()
     fname = os.path.join(exports, f"{table_name}_fallback_{FALLBACK_RUN_ID}.csv")
-    write_header = not pathlib.Path(fname).exists()
-    # Normalize keys to strings and ensure consistent order
-    fieldnames = list(data.keys())
+    incoming = {str(k): (v if v is not None else '') for k, v in data.items()}
+
+    def record_key(row):
+        for field in ("url", "Id", "address_db"):
+            value = row.get(field)
+            if value not in (None, ""):
+                return field, str(value)
+        notice = row.get("Notice")
+        return ("Notice", str(notice)) if notice not in (None, "") else (None, None)
+
     try:
-        with open(fname, "a", newline='', encoding='utf-8') as fh:
-            writer = csv.DictWriter(fh, fieldnames=fieldnames)
-            if write_header:
+        rows = []
+        fieldnames = []
+        if pathlib.Path(fname).exists():
+            with open(fname, "r", newline='', encoding="utf-8") as fh:
+                reader = csv.DictReader(fh)
+                fieldnames = list(reader.fieldnames or [])
+                rows = list(reader)
+
+        fieldnames.extend(key for key in incoming if key not in fieldnames)
+        key = record_key(incoming)
+        replaced = False
+        if key[0]:
+            for index, row in enumerate(rows):
+                if record_key(row) == key:
+                    rows[index] = {**row, **incoming}
+                    replaced = True
+                    break
+        if not replaced:
+            rows.append(incoming)
+
+        fd, temp_name = tempfile.mkstemp(
+            prefix="fallback_", suffix=".csv", dir=exports, text=True
+        )
+        os.close(fd)
+        try:
+            with open(temp_name, "w", newline='', encoding="utf-8") as fh:
+                writer = csv.DictWriter(fh, fieldnames=fieldnames, extrasaction="ignore")
                 writer.writeheader()
-            writer.writerow({k: (v if v is not None else '') for k, v in data.items()})
+                writer.writerows(rows)
+            os.replace(temp_name, fname)
+        finally:
+            if os.path.exists(temp_name):
+                os.unlink(temp_name)
         print_log(f"Wrote fallback record to {fname}")
+        return fname
     except Exception as e:
         print_log(f"Failed to write fallback CSV: {e}", True)
+        raise
 
 
 # ---- Generic utilities (from original helper.py) ----
@@ -115,19 +168,27 @@ def time_elapsed_str(start, end):
 
 def call_chatgpt(text):
     prompt = """
-    Extract the address information (Street, City, Zip_Code) from any foreclosure details provided or PDF Url. Output only a JSON object containing these fields. Do not include any additional text, notes, or formatting, as your response will be directly parsed by a script.
+    Extract property information from the foreclosure notice provided. Use the
+    foreclosed/tax-sale property address, never a lender, law firm, courthouse,
+    or mailing address. owner_name means borrower, debtor, defendant, current
+    owner, or party in possession associated with that property. Output only one
+    JSON object containing the fields below.
 
     - When a foreclosure listing or description is shared, carefully identify and extract:
     - Street: (full street address)
     - City: (name of the city)
     - Zip_Code: (5-digit postal code)
+    - owner_name: (property owner or borrower name; join multiple owners with " & ")
+    - parcel_number: (tax parcel/APN, when present)
 
     - Output only the following JSON structure:
 
     {
     "Street": "[Extracted street address]",
     "City": "[Extracted city name]",
-    "Zip_Code": "[Extracted zip code]"
+    "Zip_Code": "[Extracted zip code]",
+    "owner_name": "[Extracted owner or borrower name]",
+    "parcel_number": "[Extracted parcel number]"
     }
 
     - If any element cannot be confidently determined, leave its value an empty string ("").
@@ -186,36 +247,163 @@ def solve_captcha_token(site_url, site_key, captcha_type="recaptcha"):
         print_log("Captcha task still processing...")
     return 0, "ERROR_CAPTCHA_TIMEOUT"
 
+_NOTICE_FIELDS = ("Street", "City", "Zip_Code", "owner_name", "parcel_number")
+_STREET_PATTERN = re.compile(
+    r"(?P<street>\d{1,7}\s+[A-Z0-9][A-Z0-9 .#'&/-]{1,80}?\b(?:"
+    r"ROAD|RD|STREET|ST|DRIVE|DR|AVENUE|AVE|LANE|LN|COURT|CT|"
+    r"BOULEVARD|BLVD|HIGHWAY|HWY|WAY|TRAIL|TRL|PLACE|PL|CIRCLE|"
+    r"CIR|PARKWAY|PKWY|TERRACE|TER))\b",
+    re.IGNORECASE,
+)
+_PO_BOX_PATTERN = re.compile(
+    r"^\s*(?:P\.?\s*O\.?|POST\s+OFFICE)\s+BOX\b", re.IGNORECASE
+)
+
+
+def _clean_notice_value(value):
+    if value is None:
+        return ""
+    return re.sub(r"\s+", " ", str(value)).strip(" \t\r\n,;:-")
+
+
+def _fallback_notice_fields(notice):
+    """Extract common GA/NC property phrases when API output misses fields."""
+    text = re.sub(r"\s+", " ", str(notice or "")).strip()
+    result = {field: "" for field in _NOTICE_FIELDS}
+    if not text:
+        return result
+
+    matches = list(_STREET_PATTERN.finditer(text))
+    if matches:
+        labels = (
+            "commonly known as",
+            "property known as",
+            "known as",
+            "l/k/a",
+            "occupant",
+            "property address",
+        )
+
+        def address_score(match):
+            prefix = text[max(0, match.start() - 60):match.start()].lower()
+            score = max(
+                (100 + prefix.rfind(label) for label in labels if label in prefix),
+                default=0,
+            )
+            if any(
+                word in prefix
+                for word in ("attorney", "counsel", "prepared by", "undersigned at")
+            ):
+                score -= 100
+            return score
+
+        chosen = max(matches, key=address_score)
+        result["Street"] = _clean_notice_value(chosen.group("street"))
+        tail = text[chosen.end():chosen.end() + 100]
+        city_state = re.match(
+            r"\s*,?\s*(?P<city>[A-Za-z][A-Za-z .'-]{1,45}?)\s*,?\s+"
+            r"(?:GA|GEORGIA|NC|NORTH CAROLINA)\s+(?P<zip>\d{5})(?:-\d{4})?\b",
+            tail,
+            re.IGNORECASE,
+        )
+        if city_state:
+            city = _clean_notice_value(city_state.group("city"))
+            if not city.lower().endswith(" county"):
+                result["City"] = city
+            result["Zip_Code"] = city_state.group("zip")
+        if not result["City"]:
+            town = re.search(
+                r"\b(?:Town|City) of\s+([A-Za-z][A-Za-z .'-]{1,45}?)(?:,|\s+County\b)",
+                text,
+                re.IGNORECASE,
+            )
+            if town:
+                result["City"] = _clean_notice_value(town.group(1))
+
+    parcel = re.search(
+        r"(?:tax\s+parcel(?:\s+identification)?(?:\s+(?:number|no\.?))?|"
+        r"parcel(?:\s+(?:number|no\.?|id(?:entification)?))?|APN)\s*[:#]?\s*"
+        r"([A-Z0-9][A-Z0-9._/-]{3,40})",
+        text,
+        re.IGNORECASE,
+    )
+    if parcel:
+        result["parcel_number"] = _clean_notice_value(parcel.group(1)).rstrip(".")
+
+    owner_patterns = (
+        r"same parcel conveyed to\s+(.+?)\s+in a deed",
+        r"party in possession of the property is\s+(.+?)(?:\s+or tenant|;|\.)",
+        r"as Attorney in Fact for\s+(.+?)(?:\.|$)",
+        r"Security Deed given by\s+(.+?)(?:,?\s+(?:dated|to|Mortgage Electronic))",
+        r"\b(?:v\.?s?\.?)\s+([^,]+)",
+        r"\bTO:\s+(.+?)\s+(?:Occupant\s+\d|RE:\s+FORECLOSURE)",
+    )
+    for pattern in owner_patterns:
+        owner = re.search(pattern, text, re.IGNORECASE)
+        if owner:
+            result["owner_name"] = _clean_notice_value(owner.group(1))
+            break
+    return result
+
+
+def _decode_notice_json(raw):
+    text = str(raw or "").strip()
+    text = re.sub(r"^\`\`\`(?:json)?\s*|\s*\`\`\`$", "", text, flags=re.IGNORECASE)
+    return json.loads(text)
+
+
+def extract_pdf_text(page, pdf_url):
+    """Download notice PDF with browser cookies and return embedded text."""
+    full_url = urljoin(page.url, str(pdf_url or "").strip())
+    if not full_url:
+        return ""
+    response = page.context.request.get(full_url, timeout=GRID_TIMEOUT_MS)
+    if not response.ok:
+        raise RuntimeError(
+            "PDF download failed: {} {}".format(
+                response.status, response.status_text
+            )
+        )
+    reader = PdfReader(io.BytesIO(response.body()))
+    text = "\n".join(pdf_page.extract_text() or "" for pdf_page in reader.pages)
+    return text.strip()[:PDF_TEXT_LIMIT]
+
+
 def parse_notice(notice):
-    arr_response = dict()
+    arr_response = {}
+    fallback = _fallback_notice_fields(notice)
     try:
         print_log("Parsing Notice with ChatGPT...")
         result = call_chatgpt(notice)
         try:
-            arr_response = json.loads(result)
+            arr_response = _decode_notice_json(result)
         except json.JSONDecodeError:
             fix_notice = notice.replace('"', '').strip()
             print_log("Parsing Notice again...")
-            result_new = call_chatgpt(fix_notice)
-            arr_response = json.loads(result_new)
-        except Exception as e:
-            error_str = "\n{}: {}".format(str(type(e).__name__), str(e))
-            print_log(error_str, True)
-
-        if bool(arr_response):
-            arr_response.update({'Address': str(True)})
-            if not all(bool(arr_response.get(key)) for key in ['Street', 'City']):
-                arr_response = dict()
-
-            if any(value is None for value in arr_response.values()):
-                for key, value in arr_response.items():
-                    if value is None:
-                        arr_response[key] = ''
+            arr_response = _decode_notice_json(call_chatgpt(fix_notice))
     except Exception as e:
         error_str = "\n{}: {}".format(str(type(e).__name__), str(e))
         print_log(error_str, True)
 
-    return arr_response
+    if not isinstance(arr_response, dict):
+        arr_response = {}
+    merged = {}
+    for field in _NOTICE_FIELDS:
+        merged[field] = _clean_notice_value(arr_response.get(field)) or fallback[field]
+    if not any(merged.values()):
+        return {}
+    merged["Address"] = str(
+        bool(merged["Street"]) and not _PO_BOX_PATTERN.match(merged["Street"])
+    )
+    return merged
+
+
+def is_propstream_eligible(record):
+    """Require complete property location; incomplete records stay NULL."""
+    street = _clean_notice_value((record or {}).get("Street"))
+    city = _clean_notice_value((record or {}).get("City"))
+    state = _clean_notice_value((record or {}).get("State"))
+    return bool(street and city and state and not _PO_BOX_PATTERN.match(street))
 
 
 def start_logger(limited, database, source):
@@ -352,7 +540,7 @@ def init_driver():
     global _pw_instance
     _pw_instance = sync_playwright().start()
     browser = _pw_instance.chromium.launch(
-        headless=FAST_MODE,
+        headless=HEADLESS,
         args=["--disable-blink-features=AutomationControlled"],
     )
     context = browser.new_context(
@@ -384,6 +572,56 @@ def wait_loader(page, max_attempts=4):
     # fallback: short sleep to allow page to settle
     time.sleep(0.2)
     return
+
+
+SEARCH_GRID_SELECTOR = "#ctl00_ContentPlaceHolder1_upSearch"
+RESULTS_PER_PAGE_SELECTOR = (
+    "#ctl00_ContentPlaceHolder1_WSExtendedGridNP1_GridView1_ctl01_ddlPerPage"
+)
+CURRENT_PAGE_SELECTOR = (
+    "#ctl00_ContentPlaceHolder1_WSExtendedGridNP1_GridView1_ctl01_lblCurrentPage"
+)
+NEXT_PAGE_SELECTOR = (
+    "#ctl00_ContentPlaceHolder1_WSExtendedGridNP1_GridView1_ctl01_btnNext"
+)
+
+
+def _wait_for_search_grid(page, timeout=None):
+    timeout = timeout or GRID_TIMEOUT_MS
+    if str(page.url).startswith("chrome-error://"):
+        raise RuntimeError("Browser is on Chrome error page: {}".format(page.url))
+    try:
+        page.wait_for_load_state("domcontentloaded", timeout=timeout)
+    except PlaywrightTimeoutError:
+        pass
+    grid = page.wait_for_selector(SEARCH_GRID_SELECTOR, timeout=timeout)
+    if not grid:
+        raise RuntimeError("Search grid did not load at {}".format(page.url))
+    return grid
+
+
+def _set_max_results_per_page(page):
+    page.wait_for_selector(
+        RESULTS_PER_PAGE_SELECTOR, state="visible", timeout=GRID_TIMEOUT_MS
+    )
+    options = page.eval_on_selector_all(
+        f"{RESULTS_PER_PAGE_SELECTOR} option", "opts => opts.map(o => o.value)"
+    )
+    if not options:
+        raise RuntimeError("Results-per-page selector has no options")
+    page.select_option(RESULTS_PER_PAGE_SELECTOR, value=options[-1])
+    wait_loader(page)
+    return _wait_for_search_grid(page)
+
+
+def _current_search_page(page):
+    try:
+        current = page.wait_for_selector(
+            CURRENT_PAGE_SELECTOR, timeout=min(GRID_TIMEOUT_MS, 15000)
+        )
+        return int(current.inner_text().strip())
+    except Exception:
+        return 1
 
 
 def select_site_filters(page, days_back=None):
@@ -445,33 +683,131 @@ def select_site_filters(page, days_back=None):
 
 def select_filters_again(page):
     select_site_filters(page)
-
-    ddl = "#ctl00_ContentPlaceHolder1_WSExtendedGridNP1_GridView1_ctl01_ddlPerPage"
-    page.wait_for_selector(ddl, state="visible", timeout=30000)
-    options = page.eval_on_selector_all(f"{ddl} option", "opts => opts.map(o => o.value)")
-    num_str = options[-1]
     time.sleep(random.randint(1, 3) * SLEEP_SCALE)
-    page.select_option(ddl, value=num_str)
+    _set_max_results_per_page(page)
 
 
-def evaluate_pages_to_work(page):
-    pages = []
-    print_log("Page Loaded...")
-    select_site_filters(page)
+def recover_search_page(page, site_url, target_page=1):
+    """Rebuild search state after interrupted navigation and return to target page."""
+    last_error = None
+    for attempt in range(1, NAVIGATION_RETRIES + 1):
+        try:
+            print_log(
+                "Recovering search grid (attempt {}/{}, target page {})".format(
+                    attempt, NAVIGATION_RETRIES, target_page
+                )
+            )
+            page.goto(site_url, timeout=GRID_TIMEOUT_MS, wait_until="domcontentloaded")
+            select_filters_again(page)
+            current = _current_search_page(page)
+            while current < target_page:
+                next_btn = page.wait_for_selector(
+                    NEXT_PAGE_SELECTOR, timeout=GRID_TIMEOUT_MS
+                )
+                if next_btn.get_attribute("disabled") is not None:
+                    raise RuntimeError(
+                        "Cannot recover target page {}; Next is disabled on page {}".format(
+                            target_page, current
+                        )
+                    )
+                next_btn.click()
+                wait_loader(page)
+                _wait_for_search_grid(page)
+                new_current = _current_search_page(page)
+                if new_current <= current:
+                    raise RuntimeError("Search page did not advance from {}".format(current))
+                current = new_current
+            if current != target_page:
+                raise RuntimeError(
+                    "Recovered page {} instead of {}".format(current, target_page)
+                )
+            return page
+        except Exception as error:
+            last_error = error
+            print_log(
+                "Search recovery attempt {} failed: {}".format(attempt, error), True
+            )
+            if attempt < NAVIGATION_RETRIES:
+                time.sleep(attempt * 2)
+    raise RuntimeError(
+        "Unable to recover search page {} after {} attempts: {}".format(
+            target_page, NAVIGATION_RETRIES, last_error
+        )
+    )
 
-    ddl = "#ctl00_ContentPlaceHolder1_WSExtendedGridNP1_GridView1_ctl01_ddlPerPage"
-    page.wait_for_selector(ddl, state="visible", timeout=30000)
-    options = page.eval_on_selector_all(f"{ddl} option", "opts => opts.map(o => o.value)")
-    num_str = options[-1]
-    time.sleep(random.randint(1, 3))
-    page.select_option(ddl, value=num_str)
+
+def return_to_search_page(page, site_url, target_page):
+    """Use session search URL first; fully rebuild filters if state is unhealthy."""
+    import re as _re
 
     try:
-        wait_loader(page)
-        print_log("\nWaiting for Search Grid")
-        search_grid = page.wait_for_selector("#ctl00_ContentPlaceHolder1_upSearch", timeout=30000)
-    except Exception:
-        search_grid = None
+        session = _re.search(r'/\(S\([^)]+\)\)/', str(page.url))
+        search_url = (
+            site_url.rstrip('/') + session.group(0) + "Search.aspx"
+            if session
+            else site_url + "Search.aspx"
+        )
+        page.goto(search_url, timeout=GRID_TIMEOUT_MS, wait_until="domcontentloaded")
+        _wait_for_search_grid(page)
+        if _current_search_page(page) != target_page:
+            raise RuntimeError("Search session returned to wrong page")
+        return page
+    except Exception as error:
+        print_log("Direct search return failed: {}; rebuilding search.".format(error), True)
+        return recover_search_page(page, site_url, target_page)
+
+
+def open_notice_detail(page, button):
+    """Open embedded detail URL directly, avoiding fragile JavaScript history."""
+    import urllib.parse
+
+    onclick = button.get_attribute("onclick") or ""
+    marker = "location.href='"
+    if marker in onclick:
+        relative_url = onclick.split(marker, 1)[1].split("'", 1)[0]
+        detail_url = urllib.parse.urljoin(page.url, relative_url)
+        page.goto(
+            detail_url, timeout=GRID_TIMEOUT_MS, wait_until="domcontentloaded"
+        )
+    else:
+        button.click()
+    if "Details.aspx" not in str(page.url):
+        raise RuntimeError("Notice button did not open a detail page")
+    return page
+
+
+def evaluate_pages_to_work(page, max_records=None):
+    pages = []
+    print_log("Page Loaded...")
+    site_url = page.url
+    search_grid = None
+    last_error = None
+    for attempt in range(1, NAVIGATION_RETRIES + 1):
+        try:
+            if attempt > 1:
+                page.goto(
+                    site_url, timeout=GRID_TIMEOUT_MS, wait_until="domcontentloaded"
+                )
+            select_site_filters(page)
+            time.sleep(random.randint(1, 3) * SLEEP_SCALE)
+            _set_max_results_per_page(page)
+            print_log("\nWaiting for Search Grid")
+            search_grid = _wait_for_search_grid(page)
+            break
+        except Exception as error:
+            last_error = error
+            print_log(
+                "Initial grid attempt {}/{} failed: {}".format(
+                    attempt, NAVIGATION_RETRIES, error
+                ),
+                True,
+            )
+    if search_grid is None:
+        raise RuntimeError(
+            "Unable to initialize notice search grid after {} attempts: {}".format(
+                NAVIGATION_RETRIES, last_error
+            )
+        )
 
     if search_grid:
         page_current = 0
@@ -485,12 +821,8 @@ def evaluate_pages_to_work(page):
         seen_pages = set()
 
         while page_current != page_last:
-            page.wait_for_selector("#ctl00_ContentPlaceHolder1_upSearch", timeout=15000)
-            try:
-                curr = page.wait_for_selector("#ctl00_ContentPlaceHolder1_WSExtendedGridNP1_GridView1_ctl01_lblCurrentPage", timeout=15000)
-                page_current = int(curr.inner_text())
-            except Exception:
-                page_current = 1
+            _wait_for_search_grid(page)
+            page_current = _current_search_page(page)
 
             print_log("-" * 80)
             print_log("Working on Page # {}".format(page_current))
@@ -499,7 +831,10 @@ def evaluate_pages_to_work(page):
             if page_current not in seen_pages:
                 seen_pages.add(page_current)
 
-                page.wait_for_selector("input.viewButton[onclick^='javascript']", timeout=30000)
+                page.wait_for_selector(
+                    "input.viewButton[onclick^='javascript']",
+                    timeout=GRID_TIMEOUT_MS,
+                )
                 button_count = page.locator("input.viewButton[onclick^='javascript']").count()
 
                 for x in range(1, button_count + 1):
@@ -507,13 +842,17 @@ def evaluate_pages_to_work(page):
                     id_str = f"0{row_id}" if row_id < 10 else str(row_id)
                     pages.append("{}_{}".format(page_current, id_str))
 
+            if max_records and len(pages) >= max_records:
+                break
+
             if page_current == page_last:
                 break
 
             # Check if Next button is enabled before clicking
-            next_sel = "#ctl00_ContentPlaceHolder1_WSExtendedGridNP1_GridView1_ctl01_btnNext"
             try:
-                next_btn = page.wait_for_selector(next_sel, timeout=10000)
+                next_btn = page.wait_for_selector(
+                    NEXT_PAGE_SELECTOR, timeout=GRID_TIMEOUT_MS
+                )
                 is_disabled = next_btn.get_attribute("disabled")
                 if is_disabled is not None:
                     print_log("Next button is disabled — reached last page")
@@ -525,12 +864,27 @@ def evaluate_pages_to_work(page):
             print_log("Click Next Page...")
             next_btn.click()
             wait_loader(page)
-            page.wait_for_selector("#ctl00_ContentPlaceHolder1_upSearch", timeout=30000)
+            _wait_for_search_grid(page)
             w = random.randint(1, 3)
             print_log("Waiting {} seconds for Search Grid...".format(w))
             time.sleep(w)
 
-    return pages
+    return pages[:max_records] if max_records else pages
+
+
+def save_notice_record(database, record, table_name):
+    """Persist every scraped notice, falling back only when DB write fails."""
+    if database is not None:
+        try:
+            if database.pub_data(record, table_name):
+                return "database"
+            raise RuntimeError("Database notice write returned false")
+        except Exception as error:
+            print_log(
+                "Unable to save notice in database: {}".format(error), True
+            )
+    _save_record_to_csv(record, table_name)
+    return "csv"
 
 
 def get_data(page, database, state_name):
@@ -656,7 +1010,7 @@ def get_data(page, database, state_name):
                 captcha = False
     except Exception as ex:
         print_log(f"get_data exception: {ex}", True)
-        move = True
+        move = False
 
     web_scrape = {}
     if move:
@@ -689,7 +1043,21 @@ def get_data(page, database, state_name):
                 if pdf_tag:
                     pdf_url = page.locator("#ctl00_ContentPlaceHolder1_PublicNoticeDetailsBody1_spanFileLink a").first.get_attribute("href")
                     print_log("PDF File: '{}'".format(pdf_url))
-                    api_data = pdf_url.strip()
+                    try:
+                        pdf_text = extract_pdf_text(page, pdf_url)
+                        if pdf_text:
+                            api_data = notice + "\n\nATTACHED PDF TEXT:\n" + pdf_text
+                            print_log(
+                                "Extracted {} characters from PDF.".format(
+                                    len(pdf_text)
+                                )
+                            )
+                        else:
+                            print_log("PDF contains no extractable text.", True)
+                    except Exception as pdf_error:
+                        print_log(
+                            "Unable to extract PDF text: {}".format(pdf_error), True
+                        )
             except PlaywrightTimeoutError:
                 print_log("No PDF File")
 
@@ -706,18 +1074,19 @@ def get_data(page, database, state_name):
                 api_result = parse_notice(api_data)
                 if api_result:
                     web_scrape.update(api_result)
-                    has_address = True
+                    has_address = bool(web_scrape.get("Street"))
             except Exception:
                 pass
 
             info = {
                 "State": state_name,
                 "Id": url.split("=")[-1],
-                "Notice": notice.replace("'", ""),
+                "Notice": notice,
                 "Publisher": publisher,
                 "Date_Published": sql_date_string,
                 "county": county_name,
                 "page_url": url,
+                "propstream_info": None,
             }
             web_scrape.update(info)
 
@@ -732,18 +1101,13 @@ def get_data(page, database, state_name):
                     else:
                         print_log("'{}': {}".format(k, val))
 
-            if has_address:
-                table_name = "NcPub" if state_name == "NC" else "GaPub"
-                if database is not None:
-                    try:
-                        database.pub_data(web_scrape, table_name)
-                    except Exception as e:
-                        print_log("Unable to save in database: {}: {}".format(url, e), True)
-                        _save_record_to_csv(web_scrape, table_name)
-                else:
-                    _save_record_to_csv(web_scrape, table_name)
-            else:
-                print_log("Address Information is missing")
+            table_name = "NcPub" if state_name == "NC" else "GaPub"
+            save_notice_record(database, web_scrape, table_name)
+
+            if not has_address:
+                print_log(
+                    "Address information is missing; notice saved with propstream_info NULL."
+                )
 
         except Exception as scrape_ex:
             print_log(f"Failed to scrape notice content at {page.url}: {scrape_ex}", True)
@@ -755,136 +1119,85 @@ def get_all_pages(page, pagers, database, state, site_url=None):
     if site_url is None:
         site_url = "https://www.ncnotices.com/" if state == "NC" else "https://www.georgiapublicnotice.com/"
     print_log("Page Loaded...")
-    select_site_filters(page)
+    all_records = []
+    page_map = {}
+    for pager in pagers:
+        page_number, row_id = pager.split("_", 1)
+        page_map.setdefault(int(page_number), []).append(row_id)
 
-    ddl = "#ctl00_ContentPlaceHolder1_WSExtendedGridNP1_GridView1_ctl01_ddlPerPage"
-    page.wait_for_selector(ddl, state="visible", timeout=30000)
-    options = page.eval_on_selector_all(f"{ddl} option", "opts => opts.map(o => o.value)")
-    num_str = options[-1]
-    time.sleep(random.randint(1, 3))
-    page.select_option(ddl, value=num_str)
+    if not page_map:
+        print_log("No notice buttons were selected.", True)
+        return page, all_records
 
-    try:
-        wait_loader(page)
-        print_log("\nWaiting for Search Grid")
-        search_grid = page.wait_for_selector("#ctl00_ContentPlaceHolder1_upSearch", timeout=30000)
-    except Exception:
-        search_grid = None
-
-    all_records = []  # accumulate every scraped notice record
-
-    if search_grid:
-        page_current = 0
+    inc = 1
+    for page_number in sorted(page_map):
         try:
-            lbl = page.wait_for_selector("#ctl00_ContentPlaceHolder1_WSExtendedGridNP1_GridView1_ctl01_lblTotalPages", timeout=15000)
-            page_last = int(lbl.inner_text().strip().split()[1])
-        except Exception:
-            page_last = 1
-        print_log("There are {} Total Search Pages...\n".format(page_last))
+            page = recover_search_page(page, site_url, page_number)
+        except Exception as error:
+            print_log(
+                "Skipping page {} because search recovery failed: {}".format(
+                    page_number, error
+                ),
+                True,
+            )
+            inc += len(page_map[page_number])
+            continue
 
-        page_map = {}
-        for p in pagers:
-            p_num, p_id = p.split("_")
-            if int(p_num) not in page_map:
-                page_map[int(p_num)] = []
-            page_map[int(p_num)].append(p_id)
+        print_log("-" * 80)
+        print_log("Working on Page # {}".format(page_number))
 
-        pages_to_do = list(page_map.keys())
-        inc = 1
+        for id_val in list(page_map[page_number]):
+            msg = "Working on Notice # {}".format(inc)
+            print_log(msg + "-" * max(1, 60 - len(msg)))
+            saved = False
 
-        while page_current != page_last:
-            wait_loader(page)
-            page_number = pages_to_do[0]
-            page.wait_for_selector("#ctl00_ContentPlaceHolder1_upSearch", timeout=30000)
+            for attempt in range(1, NOTICE_RETRIES + 1):
+                try:
+                    _wait_for_search_grid(page)
+                    if _current_search_page(page) != page_number:
+                        page = recover_search_page(page, site_url, page_number)
 
-            try:
-                curr = page.wait_for_selector("#ctl00_ContentPlaceHolder1_WSExtendedGridNP1_GridView1_ctl01_lblCurrentPage", timeout=15000)
-                page_current = int(curr.inner_text())
-            except Exception:
-                page_current = 1
-
-            print_log("-" * 80)
-            print_log("Working on Page # {}".format(page_current))
-
-            if page_number == page_current:
-                list_id = page_map[page_number]
-
-                while list_id:
-                    page_url = page.url
-                    id_val = list_id[0]
-                    msg = "Working on Notice # {}".format(inc)
-                    print_log(msg + "-" * (60 - len(msg)))
-
-                    try:
-                        btn_sel = (
-                            f"#ctl00_ContentPlaceHolder1_WSExtendedGridNP1_"
-                            f"GridView1_ctl{id_val}_btnView2"
-                        )
-                        button = page.wait_for_selector(btn_sel, state="visible", timeout=30000)
-                        button.scroll_into_view_if_needed()
-                        button.click()
-
-                        try:
-                            page, record = get_data(page, database, state)
-                            if record and record.get('Id'):
-                                all_records.append(record)
-                        except Exception:
-                            print_log("Unable to Get Data: {}".format(page_url), True)
-
-                        w = random.randint(3, 5)
-                        print_log("Waiting {} to click back...".format(w))
-                        time.sleep(w)
-
-                        # Navigate back to search: extract session ID from current URL and
-                        # build the Search.aspx URL directly — more reliable than go_back()
-                        import re as _re
-                        print_log("\nClicking Back")
-                        _sess = _re.search(r'/\(S\([^)]+\)\)/', page.url)
-                        if _sess:
-                            _search_url = site_url.rstrip('/') + _sess.group(0) + "Search.aspx"
-                        else:
-                            _search_url = site_url + "Search.aspx"
-                        try:
-                            page.goto(_search_url, timeout=30000, wait_until="domcontentloaded")
-                            page.wait_for_selector("#ctl00_ContentPlaceHolder1_upSearch", timeout=15000)
-                        except Exception:
-                            print_log("Session search URL failed — reloading with filters", True)
-                            page.goto(site_url, timeout=60000, wait_until="domcontentloaded")
-                            select_filters_again(page)  # re-apply filters AND restore max per-page
-
-                    except Exception as e:
-                        print_log(f"Notice {inc} failed entirely: {e}", True)
-                    finally:
-                        # Always advance — never retry the same notice
-                        list_id.remove(id_val)
-                        inc += 1
-
-                pages_to_do.remove(page_number)
-
-            if page_current == page_last:
-                break
-
-            if not pages_to_do:
-                break
-
-            next_sel = "#ctl00_ContentPlaceHolder1_WSExtendedGridNP1_GridView1_ctl01_btnNext"
-            try:
-                next_btn = page.wait_for_selector(next_sel, timeout=10000)
-                is_disabled = next_btn.get_attribute("disabled")
-                if is_disabled is not None:
-                    print_log("Next button is disabled — reached last page")
+                    button_selector = (
+                        f"#ctl00_ContentPlaceHolder1_WSExtendedGridNP1_"
+                        f"GridView1_ctl{id_val}_btnView2"
+                    )
+                    button = page.wait_for_selector(
+                        button_selector, state="visible", timeout=GRID_TIMEOUT_MS
+                    )
+                    button.scroll_into_view_if_needed()
+                    open_notice_detail(page, button)
+                    page, record = get_data(page, database, state)
+                    if not record or not record.get("Id"):
+                        raise RuntimeError("Notice detail returned no record")
+                    all_records.append(record)
+                    saved = True
                     break
-            except Exception:
-                print_log("Next button not found — stopping pagination")
-                break
+                except Exception as error:
+                    print_log(
+                        "Notice {} attempt {}/{} failed: {}".format(
+                            inc, attempt, NOTICE_RETRIES, error
+                        ),
+                        True,
+                    )
+                finally:
+                    try:
+                        page = return_to_search_page(page, site_url, page_number)
+                    except Exception as recovery_error:
+                        print_log(
+                            "Notice {} search recovery failed: {}".format(
+                                inc, recovery_error
+                            ),
+                            True,
+                        )
 
-            print_log("Click Next Page...")
-            next_btn.click()
-            wait_loader(page)
-            page.wait_for_selector("#ctl00_ContentPlaceHolder1_upSearch", timeout=30000)
-            w = random.randint(3, 5)
-            print_log("Waiting {} seconds for Search Grid...".format(w))
-            time.sleep(w)
+            if not saved:
+                print_log(
+                    "Notice {} skipped after {} attempts; continuing run.".format(
+                        inc, NOTICE_RETRIES
+                    ),
+                    True,
+                )
+            inc += 1
 
     return page, all_records
 
@@ -896,14 +1209,37 @@ def make_address_db(array):
 
 
 def request_function(url, headers, payload, a_session):
-    r = dict()
-    try:
-        response = a_session.get(url, headers=headers, data=payload)
-        if response.status_code == 200:
-            r = response.json()
-    except Exception as e:
-        print_log("{}: {}".format(type(e).__name__, e), True)
-    return r
+    if hasattr(a_session, "evaluate") and hasattr(a_session, "context"):
+        result = a_session.evaluate(
+            """async ([requestUrl, requestHeaders]) => {
+                const response = await fetch(requestUrl, {
+                    method: 'GET',
+                    headers: requestHeaders,
+                    credentials: 'include'
+                });
+                return {
+                    status: response.status,
+                    statusText: response.statusText,
+                    body: await response.text()
+                };
+            }""",
+            [url, headers],
+        )
+        status = int(result.get("status", 0))
+        if status != 200:
+            raise RuntimeError(
+                "PropStream browser request failed: {} {}".format(
+                    status, result.get("statusText", "")
+                )
+            )
+        try:
+            return json.loads(result.get("body", ""))
+        except json.JSONDecodeError as error:
+            raise ValueError("PropStream response was not valid JSON") from error
+
+    response = a_session.get(url, headers=headers, data=payload, timeout=45)
+    response.raise_for_status()
+    return response.json()
 
 
 def propstream_information(db_info, propstream_session):
@@ -925,27 +1261,26 @@ def propstream_information(db_info, propstream_session):
         'sec-fetch-site': 'same-origin',
         'user-agent': USER_AGENT,
     }
-    try:
-        data = request_function(url, headers, {}, propstream_session)
-    except Exception as e:
-        data = []
-        print_log("propstream request failed: {}: {}".format(type(e).__name__, e), True)
+    data = request_function(url, headers, {}, propstream_session)
 
     ids = []
-    try:
-        if isinstance(data, list):
-            for item in data:
-                if isinstance(item, dict) and 'id' in item:
-                    ids.append(item['id'])
-        elif isinstance(data, dict):
-            arr = data.get('results') or data.get('data') or []
-            if isinstance(arr, list):
-                for item in arr:
-                    if isinstance(item, dict) and 'id' in item:
-                        ids.append(item['id'])
-    except Exception as e:
-        print_log("Error parsing propstream suggestions: {}: {}".format(type(e).__name__, e), True)
+    if isinstance(data, list):
+        suggestions = data
+    elif isinstance(data, dict):
+        suggestions = data.get('results')
+        if suggestions is None:
+            suggestions = data.get('data', [])
+    else:
+        raise ValueError(
+            "Unexpected PropStream suggestions response: {}".format(type(data).__name__)
+        )
+    if not isinstance(suggestions, list):
+        raise ValueError("PropStream suggestions payload is not a list")
+    for item in suggestions:
+        if isinstance(item, dict) and item.get('id') not in (None, ''):
+            ids.append(item['id'])
 
+    ids = list(dict.fromkeys(ids))
     print_log(f"Propstream returned {len(ids)} suggestion(s)")
     return ids
 
@@ -1010,10 +1345,43 @@ def get_propstream_address_details(prop_id, propstream_session):
         'owner_name': r.get('owner1FullName', ''),
     }
 
+def _notice_table_for_propstream(table_name, db_info):
+    table_lower = str(table_name).lower()
+    state = str(db_info.get("State", "")).upper()
+    if table_lower.endswith("_ga") or state == "GA":
+        return "GaPub"
+    if table_lower.endswith("_nc") or state == "NC":
+        return "NcPub"
+    raise ValueError("Cannot determine source notice table for {}".format(table_name))
+
+
+def _set_propstream_status(database, db_info, table_name, status):
+    notice_id = db_info.get("Id")
+    if notice_id in (None, ""):
+        print_log("PropStream tag not saved: source notice has no Id.", True)
+        return False
+    if database is None:
+        db_info["propstream_info"] = status
+        return True
+    if not hasattr(database, "set_propstream_info"):
+        print_log("PropStream tag not saved: database helper lacks updater.", True)
+        return False
+    try:
+        saved = database.set_propstream_info(
+            _notice_table_for_propstream(table_name, db_info), notice_id, status
+        )
+    except Exception as error:
+        print_log(
+            "PropStream tag {} failed for {}: {}".format(status, notice_id, error), True
+        )
+        return False
+    if saved:
+        db_info["propstream_info"] = status
+    return bool(saved)
+
+
 def get_propstream_data(database, request_session, db_info, table_name):
-    """Fetch multiple propstream property details for a given input row and save each record.
-    Returns a list of saved property dicts.
-    """
+    """Save valid details and apply Y/N only for conclusive lookup outcomes."""
     results = []
     row_index = db_info.get('Table_Index', 0)
 
@@ -1021,52 +1389,77 @@ def get_propstream_data(database, request_session, db_info, table_name):
         print_log("Getting Propstream information...")
         ids = propstream_information(db_info, request_session)
     except Exception as e:
-        ids = []
         print_log("{}: {}".format(type(e).__name__, e), True)
         print_log("Unable to fetch Propstream information: '{}'".format(row_index), True)
+        return results
 
     if not ids:
-        # nothing found
+        _set_propstream_status(database, db_info, table_name, "N")
         return results
 
     print_log(f"Found {len(ids)} suggestions for row {row_index}")
+    valid_saved = False
+    database_saved = False
 
     for prop_id in ids:
         try:
             print_log(f"Getting details for Propstream ID: {prop_id}")
-            prop_details = {
-                'ga_id': db_info.get('Id', ''),
-                'address_db': make_address_db(db_info),
-            }
             try:
                 prop_data = get_propstream_address_details(prop_id, request_session)
             except Exception as e:
                 print_log(f"Failed to get details for {prop_id}: {type(e).__name__}: {e}", True)
-                prop_data = {}
+                continue
+            if not isinstance(prop_data, dict) or not prop_data:
+                print_log(
+                    "PropStream detail {} was empty; leaving source tag NULL.".format(
+                        prop_id
+                    ),
+                    True,
+                )
+                continue
 
-            if isinstance(prop_data, dict):
-                prop_data['url'] = f"https://app.propstream.com/search/{prop_id}"
-                prop_details.update(prop_data)
-
-            # Save each result (DB or CSV fallback)
+            prop_details = {
+                'ga_id': db_info.get('Id', ''),
+                'address_db': make_address_db(db_info),
+                **prop_data,
+                'url': f"https://app.propstream.com/search/{prop_id}",
+            }
+            saved_this_result = False
             try:
                 if database is not None and hasattr(database, 'propstreams'):
-                    database.propstreams(table_name, prop_details)
+                    saved_this_result = bool(
+                        database.propstreams(table_name, prop_details)
+                    )
+                    database_saved = database_saved or saved_this_result
                 else:
                     _save_record_to_csv(prop_details, table_name)
+                    saved_this_result = True
             except Exception as e:
                 print_log("{}: {}".format(type(e).__name__, e), True)
                 print_log("Unable to save Propstreams data in database: '{}'".format(row_index), True)
                 try:
                     _save_record_to_csv(prop_details, table_name)
-                except Exception:
-                    pass
+                    saved_this_result = True
+                except Exception as fallback_error:
+                    print_log(
+                        "Unable to save PropStream fallback: {}".format(fallback_error),
+                        True,
+                    )
 
-            results.append(prop_details)
+            if saved_this_result:
+                valid_saved = True
+                results.append(prop_details)
         except Exception as e:
             print_log(f"Unexpected error processing prop id {prop_id}: {type(e).__name__}: {e}", True)
             continue
 
+    if valid_saved and (database is None or database_saved):
+        _set_propstream_status(database, db_info, table_name, "Y")
+    elif ids:
+        print_log(
+            "Suggestions existed but no valid detail was stored; propstream_info remains NULL.",
+            True,
+        )
     return results
 
 
@@ -1352,10 +1745,24 @@ def login_propstream(page):
             request_session.cookies.set(cookie['name'], cookie['value'])
 
         print_log("Logging in successfully ...")
+        request_session = page
     except Exception as e:
         print_log("{}: {}".format(type(e).__name__, e), True)
         logged_in = False
         print_log("Unable to Login...", True)
+        try:
+            screenshot_path = os.path.join(
+                _ensure_exports_dir(), "propstream_login_failed.png"
+            )
+            page.screenshot(path=screenshot_path, full_page=True)
+            print_log("PropStream login failure screenshot saved.")
+        except Exception as screenshot_error:
+            print_log(
+                "Unable to save login failure screenshot: {}".format(
+                    screenshot_error
+                ),
+                True,
+            )
 
     return logged_in, request_session
 

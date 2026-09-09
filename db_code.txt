@@ -1,0 +1,136 @@
+            if not self.connection.is_connected():
+                self.print_log("Connection lost. Reconnecting...", True)
+                self.connection.reconnect(attempts=3, delay=5)
+                self.cursor = self.connection.cursor()
+                self.print_log("Reconnected to MySQL server.")
+        except Exception as e:
+            error_str = "{}: {}".format(str(type(e).__name__), str(e))
+            self.print_log(error_str, True)
+            self.print_log(f"Reconnection failed: {e}", True)
+            raise
+
+    def pub_data(self, data, table_name):
+        data = {
+            **data,
+            'table_name': table_name
+        }
+        key_list = list(data.keys())
+        val_list = list()
+        for value in data.values():
+            if type(value) == str:
+                value = value.replace('\'', '')
+                values = f"'{value}'"
+                val_list.append(values)
+            else:
+                if not bool(value):
+                    values = "-1"
+                    val_list.append(values)
+                else:
+                    values = f"{value}"
+                    val_list.append(values)
+
+        street, city = data['Street'], data['City']
+        query = None
+        address = False
+        if bool(street) and bool(city):
+            query = "SELECT COUNT(1) FROM `{table_name}` WHERE `Street` = '{Street}' AND `City` = '{City}'".format_map(data)
+            address = True
+        else:
+            query = "SELECT COUNT(1) FROM `{table_name}` WHERE `Notice` = '{Notice}'".format_map(data)
+        self.cursor.execute(query)
+        rows = self.cursor.fetchall()
+        if bool(rows[0][0]):
+            set_equal = list()
+            skip_columns = ['table_name']
+            if bool(address):
+                skip_columns.extend(['Street', 'City'])
+            else:
+                skip_columns.append('Notice')
+            for column, values in zip(key_list, val_list):
+                if column in skip_columns:
+                    continue
+                sets = "{} = {}".format(column, values)
+                set_equal.append(sets)
+            equals = ", ".join(set_equal)
+
+            where_clause = None
+            if address:
+                where_clause = "`Street` = '{Street}' AND `City` = '{City}'".format_map(data)
+            else:
+                where_clause = "`Notice` = '{Notice}'".format_map(data)
+
+            stmt = """UPDATE `{}` SET {} WHERE {}""".format(table_name, equals, where_clause)
+        else:
+            key_list.remove('table_name')
+            val_list.remove("'{}'".format(table_name))
+            columns_str = "`, `".join(key_list)
+            values = ", ".join(val_list)
+
+            stmt = "INSERT INTO `{}` (`{}`) VALUES ({})".format(table_name, columns_str, values)
+
+        try:
+            self.run_query(stmt)
+            if stmt.startswith("UPDATE"):
+                self.print_log("\nData Updated: '{}'".format(data['Id']))
+            else:
+                self.print_log("\nData Inserted: '{}'".format(data['Id']))
+        except Exception as e:
+            error_str = "{}: {}".format(str(type(e).__name__), str(e))
+            error_sql = "SQL: '{}'".format(stmt)
+            self.print_log(error_str, True)
+            self.print_log(error_sql, True)
+
+    def propstreams(self, table_name, data):
+        data = {
+            **data,
+            'table_name': table_name
+        }
+
+        key_list = list(data.keys())
+        val_list = list()
+        for value in data.values():
+            if type(value) == str:
+                value = value.replace('\'', '')
+                values = f"'{value}'"
+                val_list.append(values)
+            else:
+                values = f"{value}"
+                val_list.append(values)
+
+        query = "SELECT COUNT(1) FROM `{table_name}` WHERE `address_db` = '{address_db}';".format_map(data)
+        self.cursor.execute(query)
+        rows = self.cursor.fetchall()
+        if bool(rows[0][0]):
+            set_equal = list()
+            skip_columns = ['table_name']
+            for column, values in zip(key_list, val_list):
+                if column in skip_columns:
+                    continue
+                sets = "{} = {}".format(column, values)
+                set_equal.append(sets)
+            equals = ", ".join(set_equal)
+
+            where_clause = "`address_db` = '{address_db}'".format_map(data)
+            stmt = """UPDATE `{}` SET {} WHERE {}""".format(table_name, equals, where_clause)
+        else:
+            key_list.remove('table_name')
+            val_list.remove("'{}'".format(table_name))
+
+            columns_str = "`, `".join(key_list)
+            values = ", ".join(val_list)
+            stmt = "INSERT INTO `{}` (`{}`) VALUES ({})".format(table_name, columns_str, values)
+
+        try:
+            self.run_query(stmt)
+            if stmt.startswith("UPDATE"):
+                self.print_log("Data Updated: '{}'".format(data['address_db']))
+            else:
+                self.print_log("Data Inserted: '{}'".format(data['address_db']))
+        except Exception as e:
+            error_str = "{}: {}".format(str(type(e).__name__), str(e))
+            error_sql = "SQL: '{}'".format(stmt)
+            self.print_log(error_str, True)
+            self.print_log(error_sql, True)
+
+    def truthfinder(self, table_name, array):
+        parse_once = True

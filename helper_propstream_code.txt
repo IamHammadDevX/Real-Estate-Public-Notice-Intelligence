@@ -1,0 +1,223 @@
+def get_propstream_data(database, request_session, db_info, table_name):
+    """Fetch multiple propstream property details for a given input row and save each record.
+    Returns a list of saved property dicts.
+    """
+    results = []
+    row_index = db_info.get('Table_Index', 0)
+
+    try:
+        print_log("Getting Propstream information...")
+        ids = propstream_information(db_info, request_session)
+    except Exception as e:
+        ids = []
+        print_log("{}: {}".format(type(e).__name__, e), True)
+        print_log("Unable to fetch Propstream information: '{}'".format(row_index), True)
+
+    if not ids:
+        # nothing found
+        return results
+
+    print_log(f"Found {len(ids)} suggestions for row {row_index}")
+
+    for prop_id in ids:
+        try:
+            print_log(f"Getting details for Propstream ID: {prop_id}")
+            prop_details = {
+                'ga_id': db_info.get('Id', ''),
+                'address_db': make_address_db(db_info),
+            }
+            try:
+                prop_data = get_propstream_address_details(prop_id, request_session)
+            except Exception as e:
+                print_log(f"Failed to get details for {prop_id}: {type(e).__name__}: {e}", True)
+                prop_data = {}
+
+            if isinstance(prop_data, dict):
+                prop_data['url'] = f"https://app.propstream.com/search/{prop_id}"
+                prop_details.update(prop_data)
+
+            # Save each result (DB or CSV fallback)
+            try:
+                if database is not None and hasattr(database, 'propstreams'):
+                    database.propstreams(table_name, prop_details)
+                else:
+                    _save_record_to_csv(prop_details, table_name)
+            except Exception as e:
+                print_log("{}: {}".format(type(e).__name__, e), True)
+                print_log("Unable to save Propstreams data in database: '{}'".format(row_index), True)
+                try:
+                    _save_record_to_csv(prop_details, table_name)
+                except Exception:
+                    pass
+
+            results.append(prop_details)
+        except Exception as e:
+            print_log(f"Unexpected error processing prop id {prop_id}: {type(e).__name__}: {e}", True)
+            continue
+
+    return results
+
+
+def compute_columns(records, pubs_rows=None):
+    """
+    Enrich a list of propstream or pubs record dicts with computed columns:
+    - Date_Range: bucket string
+    - Listing_Age_Days: integer
+    - Foreclosure_Stage: heuristic string
+    - Seller_Motivation, Competition, Risk_Level, Opportunity_Level: scores 0-100
+    - Recommended_Action: categorical suggestion
+
+    pubs_rows: optional list of source pubs dicts (each should include 'Id' and 'Date_Published') to match by 'ga_id'
+    """
+    if not isinstance(records, list):
+        return records
+
+    # build lookup by Id if pubs_rows provided
+    pubs_map = {}
+    if isinstance(pubs_rows, list):
+        for p in pubs_rows:
+            pid = str(p.get('Id') or p.get('Id', ''))
+            if pid:
+                pubs_map[pid] = p
+
+    def safe_int(v, default=0):
+        try:
+            return int(float(v))
+        except Exception:
+            return default
+
+    def safe_float(v, default=0.0):
+        try:
+            return float(v)
+        except Exception:
+            return default
+
+    today = datetime.today().date()
+
+    for rec in records:
+        # Initialize fields
+        rec.setdefault('Date_Range', '')
+        rec.setdefault('Listing_Age_Days', '')
+        rec.setdefault('Foreclosure_Stage', '')
+        rec.setdefault('Seller_Motivation', '')
+        rec.setdefault('Competition', '')
+        rec.setdefault('Risk_Level', '')
+        rec.setdefault('Opportunity_Level', '')
+        rec.setdefault('Recommended_Action', '')
+
+        # Try to find a date from either pubs_rows (via ga_id) or direct field
+        notice_date = None
+        # check direct common fields
+        for date_field in ('Date_Published', 'date_published', 'NoticeDate', 'notice_date', 'Date'):
+            if date_field in rec and rec[date_field]:
+                try:
+                    notice_date = datetime.strptime(rec[date_field], '%m/%d/%Y').date()
+                except Exception:
+                    try:
+                        notice_date = datetime.fromisoformat(rec[date_field]).date()
+                    except Exception:
+                        notice_date = None
+                if notice_date:
+                    break
+
+        ga_id = str(rec.get('ga_id') or rec.get('Id') or '')
+        if not notice_date and ga_id and ga_id in pubs_map:
+            pub = pubs_map[ga_id]
+            dp = pub.get('Date_Published') or pub.get('Date') or pub.get('date_published')
+            if dp:
+                try:
+                    notice_date = datetime.strptime(dp, '%m/%d/%Y').date()
+                except Exception:
+                    try:
+                        notice_date = datetime.fromisoformat(dp).date()
+                    except Exception:
+                        notice_date = None
+
+        # Compute listing age and range
+        age_days = None
+        if notice_date:
+            age_days = (today - notice_date).days
+            rec['Listing_Age_Days'] = age_days
+            if age_days <= 7:
+                rec['Date_Range'] = '0-7'
+            elif age_days <= 30:
+                rec['Date_Range'] = '8-30'
+            elif age_days <= 90:
+                rec['Date_Range'] = '31-90'
+            elif age_days <= 365:
+                rec['Date_Range'] = '91-365'
+            else:
+                rec['Date_Range'] = '365+'
+        else:
+            rec['Listing_Age_Days'] = ''
+            rec['Date_Range'] = ''
+
+        # Foreclosure stage heuristic: look for keywords
+        notice_text = (rec.get('Notice') or rec.get('notice') or '')
+        stage = ''
+        if notice_text:
+            nt = notice_text.lower()
+            if 'foreclos' in nt or 'sheriff' in nt or 'trustee' in nt:
+                if age_days is not None and age_days > 90:
+                    stage = 'Late'
+                elif age_days is not None and age_days > 30:
+                    stage = 'Scheduled'
+                else:
+                    stage = 'Initial'
+            elif 'notice to creditors' in nt or 'probate' in nt:
+                stage = 'Probate/Other'
+            else:
+                stage = 'Unknown'
+        else:
+            # fallback to propstream 'distressed' flag
+            if str(rec.get('distressed')).lower() in ['true', '1', 'yes']:
+                stage = 'Distressed'
+            else:
+                stage = 'Unknown'
+        rec['Foreclosure_Stage'] = stage
+
+        # Numeric inputs for scoring
+        est_value = safe_float(rec.get('estimated_value', 0))
+        est_equity = safe_float(rec.get('est_equity', 0))
+        open_mortgages = safe_int(rec.get('open_mortgages', 0))
+        properties_owned = safe_int(rec.get('properties', 0))
+        owner_occ = str(rec.get('owner_status') or rec.get('ownerOccupancy') or rec.get('owner_occupancy') or '').lower()
+
+        equity_pct = None
+        if est_value > 0:
+            try:
+                equity_pct = max(0.0, min(100.0, (est_equity / est_value) * 100.0))
+            except Exception:
+                equity_pct = None
+        if equity_pct is None:
+            equity_pct = 50.0
+
+        # seller motivation: older listings + low equity => higher motivation
+        age_score = 0.0
+        if age_days is not None:
+            age_score = min(100.0, (age_days / 365.0) * 100.0)
+        seller_motivation = int(max(0, min(100, (age_score * 0.6 + (100.0 - equity_pct) * 0.4))))
+
+        # competition: fewer properties owned => less competition
+        competition = 50
+        if properties_owned > 0:
+            competition = int(max(0, min(100, 100 - properties_owned * 10)))
+
+        # risk: low equity, many liens, non-owner-occupied increase risk
+        risk = int(max(0, min(100, ((100.0 - equity_pct) * 0.5) + (min(open_mortgages, 5) / 5.0 * 100.0) * 0.3 + (0 if 'owner' in owner_occ else 30) * 0.2)))
+
+        # opportunity: combine motivation and low risk
+        opportunity = int(max(0, min(100, (seller_motivation * 0.7 + (100 - risk) * 0.3))))
+
+        # recommended action
+        if opportunity >= 70:
+            action = 'Make Offer'
+        elif opportunity >= 40:
+            action = 'Contact Owner'
+        elif opportunity >= 20:
+            action = 'Monitor / Research'
+        else:
+            action = 'Low Priority'
+
+        rec['Seller_Motivation'] = seller_motivation
+        rec['Competition'] = competition

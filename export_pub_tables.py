@@ -25,10 +25,8 @@ TABLES = ['GaPub', 'NcPub']
 
 
 def fetch_table(db, table_name):
-    db.cursor.execute(f"SELECT * FROM `{table_name}`")
-    rows = db.cursor.fetchall()
-    cols = db.cursor.column_names
-    return cols, rows
+    table_sql = db._quote_identifier(table_name)
+    return db.fetch_all(f"SELECT * FROM {table_sql}")
 
 
 def export_csv(table_name, cols, rows):
@@ -80,7 +78,7 @@ def create_zip(files):
 
 
 def main():
-    dev = bool(os.environ.get('DEV_MODE'))
+    dev = os.environ.get('DEV_MODE', '').strip().lower() in {'1', 'true', 'yes', 'on'}
     db = Mysql(dev)
     exported_files = []
 

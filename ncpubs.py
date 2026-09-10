@@ -70,6 +70,7 @@ def main(limit=None):
     propstream_results = {}  # notice Id -> list of propstream dicts
     propstream_failures = []
     parse_propstream, propstream_session = util.login_propstream(page)
+    propstream_login_failed = not parse_propstream
 
     if parse_propstream:
         usable = [
@@ -160,7 +161,8 @@ def main(limit=None):
             from openpyxl import load_workbook
             from openpyxl.styles import Font
 
-            df = pd.DataFrame(combined, columns=all_keys)
+            excel_records = util.sanitize_excel_records(combined)
+            df = pd.DataFrame(excel_records, columns=all_keys)
             xlsx_path = os.path.join(out_dir, f'NcCombined_{ts}.xlsx')
             df.to_excel(xlsx_path, index=False)
 
@@ -183,7 +185,13 @@ def main(limit=None):
     ends = time.time()
     util.print_log("--Finish--")
     util.print_log(util.time_elapsed_str(starts, ends))
-    if strict_run and (scrape_error or scrape_failures or propstream_failures):
+    if propstream_failures and not propstream_login_failed:
+        util.print_log(
+            f"Propstream left {len(propstream_failures)} record(s) NULL after lookup errors; "
+            "continuing because NULL is the required error state.",
+            True,
+        )
+    if strict_run and (scrape_error or scrape_failures or propstream_login_failed):
         raise RuntimeError(
             "Incomplete NC run: scrape_error={}, failed_notices={}, "
             "failed_propstream={}".format(

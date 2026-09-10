@@ -4,6 +4,7 @@
 
 import os
 import csv
+import re
 import zipfile
 from datetime import datetime
 from db_file import Mysql
@@ -22,6 +23,12 @@ OUTPUT_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), 'exports'))
 os.makedirs(OUTPUT_DIR, exist_ok=True)
 
 TABLES = ['GaPub', 'NcPub']
+EXCEL_ILLEGAL_CHARACTERS = re.compile(r"[\x00-\x08\x0B\x0C\x0E-\x1F]")
+
+
+def sanitize_excel_value(value):
+    text = str(value) if value is not None else ''
+    return EXCEL_ILLEGAL_CHARACTERS.sub('', text)
 
 
 def fetch_table(db, table_name):
@@ -54,7 +61,7 @@ def export_xlsx(table_name, cols, rows):
         cell.font = openpyxl.styles.Font(bold=True)
 
     for row in rows:
-        ws.append([str(v) if v is not None else '' for v in row])
+        ws.append([sanitize_excel_value(v) for v in row])
 
     # Auto-fit column widths (approximate)
     for col in ws.columns:

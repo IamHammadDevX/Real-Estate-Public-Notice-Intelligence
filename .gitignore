@@ -77,3 +77,4 @@ tmp/
 # Project-specific local scripts that are not meant for repo publishing
 *.bat
 *.cmd
+PROJECT_MEMORY.md

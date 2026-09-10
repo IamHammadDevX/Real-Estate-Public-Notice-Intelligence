@@ -76,6 +76,21 @@ _pw_instance = None
 
 # Fallback run id for CSV exports when DB is unavailable
 FALLBACK_RUN_ID = datetime.now().strftime('%Y%m%d_%H%M%S')
+EXCEL_ILLEGAL_CHARACTERS = re.compile(r"[\x00-\x08\x0B\x0C\x0E-\x1F]")
+
+
+def sanitize_excel_value(value):
+    """Remove control characters that openpyxl rejects in worksheet cells."""
+    if isinstance(value, str):
+        return EXCEL_ILLEGAL_CHARACTERS.sub("", value)
+    return value
+
+
+def sanitize_excel_records(records):
+    return [
+        {key: sanitize_excel_value(value) for key, value in row.items()}
+        for row in records
+    ]
 
 
 def _ensure_exports_dir():

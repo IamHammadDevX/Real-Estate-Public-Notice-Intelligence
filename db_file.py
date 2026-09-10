@@ -112,6 +112,18 @@ class Mysql:
         rows = self._execute(query, params=params, fetch="all")
         return tuple(self.cursor.column_names), rows
 
+    def get_pub_record(self, table_name, notice_id):
+        """Return one saved source notice as a dict for restart-safe resume."""
+        if table_name not in {'GaPub', 'NcPub'}:
+            raise ValueError("Unsupported notice table: {}".format(table_name))
+        columns, rows = self.fetch_all(
+            "SELECT * FROM {} WHERE `Id` = %s LIMIT 1".format(
+                self._quote_identifier(table_name)
+            ),
+            (notice_id,),
+        )
+        return dict(zip(columns, rows[0])) if rows else None
+
     def Close_db(self):
         if self.connection is not None and self.connection.is_connected():
             if self.cursor is not None:

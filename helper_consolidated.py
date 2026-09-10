@@ -64,6 +64,7 @@ GRID_TIMEOUT_MS = int(os.environ.get("GRID_TIMEOUT_MS", "90000"))
 NAVIGATION_RETRIES = max(1, int(os.environ.get("NAVIGATION_RETRIES", "3")))
 NOTICE_RETRIES = max(1, int(os.environ.get("NOTICE_RETRIES", "2")))
 PDF_TEXT_LIMIT = max(1000, int(os.environ.get("PDF_TEXT_LIMIT", "50000")))
+RESUME_EXISTING = _env_flag("RESUME_EXISTING")
 
 USER_AGENT = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
@@ -805,6 +806,13 @@ def open_notice_detail(page, button):
     return page
 
 
+def notice_id_from_button(button):
+    """Extract stable public-notice ID without opening its detail page."""
+    onclick = button.get_attribute("onclick") or ""
+    match = re.search(r"[?&]ID=([^&'\"]+)", onclick, re.IGNORECASE)
+    return match.group(1).strip() if match else ""
+
+
 def evaluate_pages_to_work(page, max_records=None):
     pages = []
     print_log("Page Loaded...")
@@ -1199,6 +1207,7 @@ def get_all_pages(
             msg = "Working on Notice # {}".format(inc)
             print_log(msg + "-" * max(1, 60 - len(msg)))
             saved = False
+            resumed = False
 
             for attempt in range(1, NOTICE_RETRIES + 1):
                 try:
@@ -1213,6 +1222,26 @@ def get_all_pages(
                     button = page.wait_for_selector(
                         button_selector, state="visible", timeout=GRID_TIMEOUT_MS
                     )
+                    notice_id = notice_id_from_button(button)
+                    if (
+                        RESUME_EXISTING
+                        and database is not None
+                        and notice_id
+                        and hasattr(database, "get_pub_record")
+                    ):
+                        existing = database.get_pub_record(
+                            "NcPub" if state == "NC" else "GaPub", notice_id
+                        )
+                        if existing and existing.get("Notice"):
+                            all_records.append(existing)
+                            saved = True
+                            resumed = True
+                            print_log(
+                                "RESUME state={} notice_id={} already_saved=true".format(
+                                    state, notice_id
+                                )
+                            )
+                            break
                     button.scroll_into_view_if_needed()
                     open_notice_detail(page, button)
                     page, record = get_data(page, database, state)
@@ -1229,15 +1258,16 @@ def get_all_pages(
                         True,
                     )
                 finally:
-                    try:
-                        page = return_to_search_page(page, site_url, page_number)
-                    except Exception as recovery_error:
-                        print_log(
-                            "Notice {} search recovery failed: {}".format(
-                                inc, recovery_error
-                            ),
-                            True,
-                        )
+                    if not resumed:
+                        try:
+                            page = return_to_search_page(page, site_url, page_number)
+                        except Exception as recovery_error:
+                            print_log(
+                                "Notice {} search recovery failed: {}".format(
+                                    inc, recovery_error
+                                ),
+                                True,
+                            )
 
             if not saved:
                 failures.append("{}_{}".format(page_number, id_val))

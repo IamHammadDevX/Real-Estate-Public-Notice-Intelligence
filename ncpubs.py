@@ -72,7 +72,11 @@ def main(limit=None):
     parse_propstream, propstream_session = util.login_propstream(page)
 
     if parse_propstream:
-        usable = [r for r in scraped_records if util.is_propstream_eligible(r)]
+        usable = [
+            r for r in scraped_records
+            if util.is_propstream_eligible(r)
+            and r.get("propstream_info") not in ("Y", "N")
+        ]
         skipped = len(scraped_records) - len(usable)
         if skipped:
             util.print_log(f"Skipped {skipped} P.O. Box / incomplete-address records (not searchable in Propstream)")

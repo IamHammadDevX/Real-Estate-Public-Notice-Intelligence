@@ -26,6 +26,7 @@ source "$PROJECT_DIR/venv/bin/activate"
 export PYTHONUNBUFFERED=1
 export HEADLESS=1
 export STRICT_RUN=1
+export RESUME_EXISTING=1
 
 if [[ ! -f "$STATE_DIR/ga.complete" ]]; then
     echo "STATE_START GA"

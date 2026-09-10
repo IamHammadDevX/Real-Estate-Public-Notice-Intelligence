@@ -108,6 +108,19 @@ class DatabaseStabilityTests(unittest.TestCase):
         self.assertFalse(database.set_propstream_info("GaPub", "missing", "N"))
         database.run_query.assert_not_called()
 
+    def test_get_pub_record_returns_named_fields(self):
+        database = db_file.Mysql.__new__(db_file.Mysql)
+        database.fetch_all = Mock(
+            return_value=(("Id", "Street", "Notice"), [("123", "1 Main St", "text")])
+        )
+
+        result = database.get_pub_record("GaPub", "123")
+
+        self.assertEqual(
+            {"Id": "123", "Street": "1 Main St", "Notice": "text"}, result
+        )
+        database.fetch_all.assert_called_once()
+
 
 class FallbackCsvTests(unittest.TestCase):
     def test_fallback_unions_schema_and_upserts_duplicate_id(self):
@@ -307,6 +320,53 @@ class PropStreamStatusTests(unittest.TestCase):
 
 
 class NavigationRecoveryTests(unittest.TestCase):
+    def test_notice_id_is_read_from_button_without_navigation(self):
+        button = Mock()
+        button.get_attribute.return_value = (
+            "javascript:location.href='Details.aspx?SID=session&ID=9374100'"
+        )
+        self.assertEqual("9374100", util.notice_id_from_button(button))
+
+    def test_resume_skips_saved_notice_without_opening_detail(self):
+        page = Mock()
+        page.url = "https://example.test/Search.aspx"
+        button = Mock()
+        button.get_attribute.return_value = (
+            "javascript:location.href='Details.aspx?SID=session&ID=9374100'"
+        )
+        page.wait_for_selector.return_value = button
+        database = Mock()
+        database.get_pub_record.return_value = {
+            "Id": "9374100",
+            "Notice": "saved",
+            "Street": "3892 Highway 120",
+            "City": "Tallapoosa",
+            "State": "GA",
+            "propstream_info": None,
+        }
+
+        with patch.object(util, "RESUME_EXISTING", True), patch.object(
+            util, "recover_search_page", return_value=page
+        ), patch.object(util, "_wait_for_search_grid"), patch.object(
+            util, "_current_search_page", return_value=1
+        ), patch.object(util, "open_notice_detail") as open_detail, patch.object(
+            util, "get_data"
+        ) as get_data:
+            returned_page, records, failures = util.get_all_pages(
+                page,
+                ["1_03"],
+                database,
+                "GA",
+                site_url="https://example.test/",
+                return_failures=True,
+            )
+
+        self.assertIs(page, returned_page)
+        self.assertEqual(["9374100"], [str(row["Id"]) for row in records])
+        self.assertEqual([], failures)
+        open_detail.assert_not_called()
+        get_data.assert_not_called()
+
     def test_recovery_retries_after_interrupted_navigation(self):
         page = Mock()
         page.url = "chrome-error://chromewebdata/"

@@ -12,6 +12,9 @@ import os
 import random
 import time
 import re
+import json
+
+from state_config import NOTICE_TABLES, PROPSTREAM_TABLES
 
 load_dotenv()
 class Mysql:
@@ -114,7 +117,7 @@ class Mysql:
 
     def get_pub_record(self, table_name, notice_id):
         """Return one saved source notice as a dict for restart-safe resume."""
-        if table_name not in {'GaPub', 'NcPub'}:
+        if table_name not in NOTICE_TABLES:
             raise ValueError("Unsupported notice table: {}".format(table_name))
         columns, rows = self.fetch_all(
             "SELECT * FROM {} WHERE `Id` = %s LIMIT 1".format(
@@ -205,6 +208,8 @@ class Mysql:
             raise
 
     def propstreams(self, table_name, data):
+        if table_name not in PROPSTREAM_TABLES:
+            raise ValueError("Unsupported PropStream table: {}".format(table_name))
         data = dict(data)
         table_sql = self._quote_identifier(table_name)
         address = data.get('address_db', '')
@@ -245,7 +250,7 @@ class Mysql:
             raise
 
     def set_propstream_info(self, table_name, notice_id, value):
-        if table_name not in {'GaPub', 'NcPub'}:
+        if table_name not in NOTICE_TABLES:
             raise ValueError("Unsupported notice table: {}".format(table_name))
         if value not in {'Y', 'N', None}:
             raise ValueError("propstream_info must be Y, N, or None")
@@ -275,6 +280,111 @@ class Mysql:
             )
         )
         return True
+
+    def enqueue_notice(self, state, notice_id, source_url, payload=None):
+        """Insert a durable task once; completed tasks are never reopened."""
+        payload_json = json.dumps(payload, ensure_ascii=False) if payload is not None else None
+        return self.run_query(
+            "INSERT IGNORE INTO `ScrapeQueue` "
+            "(`State`, `Notice_Id`, `Source_Url`, `Payload`) VALUES (%s, %s, %s, %s)",
+            (str(state).upper(), str(notice_id), source_url, payload_json),
+        )
+
+    def reset_processing_notices(self, state):
+        return self.run_query(
+            "UPDATE `ScrapeQueue` SET `Status`='failed', "
+            "`Last_Error`='interrupted before completion' "
+            "WHERE `State`=%s AND `Status`='processing'",
+            (str(state).upper(),),
+        )
+
+    def pending_notices(self, state, limit=None):
+        query = (
+            "SELECT `Notice_Id`, `Source_Url`, `Payload`, `Attempts` "
+            "FROM `ScrapeQueue` WHERE `State`=%s AND `Status` IN ('pending','failed') "
+            "ORDER BY `Discovered_At`, `Notice_Id`"
+        )
+        params = [str(state).upper()]
+        if limit is not None:
+            query += " LIMIT %s"
+            params.append(int(limit))
+        columns, rows = self.fetch_all(query, tuple(params))
+        return [dict(zip(columns, row)) for row in rows]
+
+    def mark_notice_processing(self, state, notice_id):
+        return self.run_query(
+            "UPDATE `ScrapeQueue` SET `Status`='processing', `Attempts`=`Attempts`+1, "
+            "`Last_Error`=NULL WHERE `State`=%s AND `Notice_Id`=%s",
+            (str(state).upper(), str(notice_id)),
+        )
+
+    def mark_notice_complete(self, state, notice_id):
+        return self.run_query(
+            "UPDATE `ScrapeQueue` SET `Status`='complete', `Last_Error`=NULL, "
+            "`Completed_At`=CURRENT_TIMESTAMP WHERE `State`=%s AND `Notice_Id`=%s",
+            (str(state).upper(), str(notice_id)),
+        )
+
+    def mark_notice_failed(self, state, notice_id, error):
+        return self.run_query(
+            "UPDATE `ScrapeQueue` SET `Status`='failed', `Last_Error`=%s "
+            "WHERE `State`=%s AND `Notice_Id`=%s",
+            (str(error)[:2000], str(state).upper(), str(notice_id)),
+        )
+
+    def get_scrape_checkpoint(self, state):
+        columns, rows = self.fetch_all(
+            "SELECT * FROM `ScrapeCheckpoints` WHERE `State`=%s LIMIT 1",
+            (str(state).upper(),),
+        )
+        if not rows:
+            return None
+        result = dict(zip(columns, rows[0]))
+        raw = result.get("Cursor_Data")
+        result["cursor"] = json.loads(raw) if raw else {}
+        return result
+
+    def save_scrape_checkpoint(
+        self, state, adapter, cursor, discovery_complete=False, total_discovered=0
+    ):
+        return self.run_query(
+            "INSERT INTO `ScrapeCheckpoints` "
+            "(`State`,`Adapter`,`Cursor_Data`,`Discovery_Complete`,`Total_Discovered`) "
+            "VALUES (%s,%s,%s,%s,%s) ON DUPLICATE KEY UPDATE "
+            "`Adapter`=VALUES(`Adapter`), `Cursor_Data`=VALUES(`Cursor_Data`), "
+            "`Discovery_Complete`=VALUES(`Discovery_Complete`), "
+            "`Total_Discovered`=VALUES(`Total_Discovered`)",
+            (
+                str(state).upper(),
+                adapter,
+                json.dumps(cursor),
+                bool(discovery_complete),
+                int(total_discovered),
+            ),
+        )
+
+    def propstream_candidates(self, state, limit=None):
+        from state_config import notice_table_for_state
+
+        table = notice_table_for_state(state)
+        columns, rows = self.fetch_all(
+            "SELECT p.* FROM {} p INNER JOIN `ScrapeQueue` q "
+            "ON q.`State`=%s AND q.`Notice_Id`=CAST(p.`Id` AS CHAR) "
+            "AND q.`Status`='complete' WHERE p.`propstream_info` IS NULL "
+            "AND TRIM(COALESCE(p.`Street`,'')) <> '' "
+            "AND TRIM(COALESCE(p.`City`,'')) <> '' ORDER BY q.`Completed_At`,p.`Table_Index`".format(
+                self._quote_identifier(table)
+            ),
+            (str(state).upper(),),
+        )
+        from helper_consolidated import is_propstream_eligible
+
+        records = [
+            record
+            for record in (dict(zip(columns, row)) for row in rows)
+            if is_propstream_eligible(record)
+        ]
+        return records[:limit] if limit is not None else records
 
     def truthfinder(self, table_name, array):
         parse_once = True

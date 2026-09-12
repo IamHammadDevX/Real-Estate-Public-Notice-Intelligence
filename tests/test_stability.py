@@ -224,6 +224,13 @@ class NoticeParsingTests(unittest.TestCase):
                 {"Street": "155 Polk Road", "City": "", "State": "GA"}
             )
         )
+
+    def test_legal_caption_is_not_a_property_street(self):
+        self.assertFalse(util.is_property_street("45 IN THE CIRCUIT COURT"))
+        self.assertFalse(
+            util.is_property_street("2025 by the 128th Judicial District Court")
+        )
+        self.assertTrue(util.is_property_street("629 Sea Pine Way Apartment H3"))
         self.assertTrue(
             util.is_propstream_eligible(
                 {
@@ -320,6 +327,28 @@ class PropStreamStatusTests(unittest.TestCase):
 
 
 class NavigationRecoveryTests(unittest.TestCase):
+    def test_init_driver_reuses_playwright_runtime(self):
+        runtime = Mock()
+        browser = Mock()
+        context = Mock()
+        page = Mock()
+        runtime.chromium.launch.return_value = browser
+        browser.new_context.return_value = context
+        context.new_page.return_value = page
+        manager = Mock()
+        manager.start.return_value = runtime
+
+        original_runtime = util._pw_instance
+        util._pw_instance = None
+        try:
+            with patch.object(util, "sync_playwright", return_value=manager):
+                util.init_driver()
+                util.init_driver()
+            self.assertEqual(manager.start.call_count, 1)
+            self.assertEqual(runtime.chromium.launch.call_count, 2)
+        finally:
+            util._pw_instance = original_runtime
+
     def test_notice_id_is_read_from_button_without_navigation(self):
         button = Mock()
         button.get_attribute.return_value = (

@@ -22,6 +22,7 @@ import requests
 import re
 from urllib.parse import urljoin
 from pypdf import PdfReader
+from state_config import get_state_config, notice_table_for_state
 
 
 try:
@@ -303,12 +304,28 @@ _STREET_PATTERN = re.compile(
 _PO_BOX_PATTERN = re.compile(
     r"^\s*(?:P\.?\s*O\.?|POST\s+OFFICE)\s+BOX\b", re.IGNORECASE
 )
+_LEGAL_STREET_FRAGMENT = re.compile(
+    r"\b(?:IN\s+THE\s+(?:CIRCUIT|SUPERIOR|PROBATE|DISTRICT)\s+COURT|"
+    r"CASE\s+NO|PLAINTIFF|DEFENDANT|"
+    r"\d{4}\s+BY\s+THE\s+\d+(?:ST|ND|RD|TH)\s+"
+    r"(?:(?:JUDICIAL\s+)?DISTRICT|CIRCUIT)\s+COURT)\b",
+    re.IGNORECASE,
+)
 
 
 def _clean_notice_value(value):
     if value is None:
         return ""
     return re.sub(r"\s+", " ", str(value)).strip(" \t\r\n,;:-")
+
+
+def is_property_street(value):
+    """Accept a street-like property location, not legal captions or PO boxes."""
+    street = _clean_notice_value(value)
+    if not street or _PO_BOX_PATTERN.match(street) or _LEGAL_STREET_FRAGMENT.search(street):
+        return False
+    match = _STREET_PATTERN.search(street)
+    return bool(match and match.start() == 0 and re.search(r"\d", street))
 
 
 def _fallback_notice_fields(notice):
@@ -347,7 +364,9 @@ def _fallback_notice_fields(notice):
         tail = text[chosen.end():chosen.end() + 100]
         city_state = re.match(
             r"\s*,?\s*(?P<city>[A-Za-z][A-Za-z .'-]{1,45}?)\s*,?\s+"
-            r"(?:GA|GEORGIA|NC|NORTH CAROLINA)\s+(?P<zip>\d{5})(?:-\d{4})?\b",
+            r"(?:GA|GEORGIA|NC|NORTH CAROLINA|FL|FLORIDA|NY|NEW YORK|"
+            r"NJ|NEW JERSEY|MD|MARYLAND|TX|TEXAS)\s+"
+            r"(?P<zip>\d{5})(?:-\d{4})?\b",
             tail,
             re.IGNORECASE,
         )
@@ -435,11 +454,13 @@ def parse_notice(notice):
     merged = {}
     for field in _NOTICE_FIELDS:
         merged[field] = _clean_notice_value(arr_response.get(field)) or fallback[field]
+    if merged["Street"] and not is_property_street(merged["Street"]):
+        merged["Street"] = ""
+    if merged["parcel_number"] and not re.search(r"\d", merged["parcel_number"]):
+        merged["parcel_number"] = ""
     if not any(merged.values()):
         return {}
-    merged["Address"] = str(
-        bool(merged["Street"]) and not _PO_BOX_PATTERN.match(merged["Street"])
-    )
+    merged["Address"] = str(is_property_street(merged["Street"]))
     return merged
 
 
@@ -448,7 +469,7 @@ def is_propstream_eligible(record):
     street = _clean_notice_value((record or {}).get("Street"))
     city = _clean_notice_value((record or {}).get("City"))
     state = _clean_notice_value((record or {}).get("State"))
-    return bool(street and city and state and not _PO_BOX_PATTERN.match(street))
+    return bool(is_property_street(street) and city and state)
 
 
 def start_logger(limited, database, source):
@@ -583,7 +604,8 @@ def wait_loader_truthfinder(a_page):
 
 def init_driver():
     global _pw_instance
-    _pw_instance = sync_playwright().start()
+    if _pw_instance is None:
+        _pw_instance = sync_playwright().start()
     browser = _pw_instance.chromium.launch(
         headless=HEADLESS,
         args=["--disable-blink-features=AutomationControlled"],
@@ -1014,9 +1036,52 @@ def get_data(page, database, state_name):
                             }
                         } catch(e) {}
                     }""", [g_response])                    # DO NOT click the button here — the callback already triggered the ASP.NET
+                    try:
+                        token_field = page.locator(
+                            'input[name="cf-turnstile-response"], '
+                            'textarea[name="cf-turnstile-response"]'
+                        ).first
+                        print_log(
+                            "Turnstile response injected: field_present={} token_length={}".format(
+                                token_field.count() > 0,
+                                len(token_field.input_value()) if token_field.count() else 0,
+                            )
+                        )
+                    except Exception:
+                        pass
                     # postback. Clicking the button would fire a second postback WITHOUT the captcha
                     # token, overriding the first response and hiding the content.
                     # Just wait for the content panel to appear from the callback's postback.
+                    widget_callback = recaptcha_elem.get_attribute("data-callback")
+                    if captcha_type == "turnstile" and not widget_callback:
+                        try:
+                            page.locator(
+                                "#ctl00_ContentPlaceHolder1_PublicNoticeDetailsBody1_btnViewNotice"
+                            ).click()
+                            page.wait_for_selector(
+                                "#ctl00_ContentPlaceHolder1_PublicNoticeDetailsBody1_pnlNoticeContent",
+                                timeout=30000,
+                            )
+                            move = True
+                        except PlaywrightTimeoutError:
+                            try:
+                                challenge_message = page.locator(
+                                    "#ctl00_ContentPlaceHolder1_PublicNoticeDetailsBody1_lblMessage"
+                                ).inner_text().strip()
+                                if challenge_message:
+                                    print_log(
+                                        "Portal response: {}".format(challenge_message),
+                                        True,
+                                    )
+                            except Exception:
+                                pass
+                            print_log(
+                                "Notice content did not appear after immediate Turnstile submit.",
+                                True,
+                            )
+                            move = False
+                        captcha = False
+                        continue
                     try:
                         page.wait_for_selector(
                             "#ctl00_ContentPlaceHolder1_PublicNoticeDetailsBody1_pnlNoticeContent",
@@ -1034,6 +1099,17 @@ def get_data(page, database, state_name):
                             )
                             move = True
                         except PlaywrightTimeoutError:
+                            try:
+                                challenge_message = page.locator(
+                                    "#ctl00_ContentPlaceHolder1_PublicNoticeDetailsBody1_lblMessage"
+                                ).inner_text().strip()
+                                if challenge_message:
+                                    print_log(
+                                        "Portal response: {}".format(challenge_message),
+                                        True,
+                                    )
+                            except Exception:
+                                pass
                             print_log(f"Notice content did not appear after captcha click (now at: {page.url})", True)
                             move = False
                     captcha = False
@@ -1142,6 +1218,19 @@ def get_data(page, database, state_name):
             }
             web_scrape.update(info)
 
+            field_limits = {
+                "Street": 100,
+                "City": 100,
+                "Zip_Code": 10,
+                "owner_name": 500,
+                "parcel_number": 500,
+                "Publisher": 100,
+                "county": 255,
+            }
+            for field, limit in field_limits.items():
+                if web_scrape.get(field) is not None:
+                    web_scrape[field] = str(web_scrape[field])[:limit]
+
             if dev:
                 print_log("-" * 20)
                 for k, val in web_scrape.copy().items():
@@ -1153,7 +1242,7 @@ def get_data(page, database, state_name):
                     else:
                         print_log("'{}': {}".format(k, val))
 
-            table_name = "NcPub" if state_name == "NC" else "GaPub"
+            table_name = notice_table_for_state(state_name)
             save_notice_record(database, web_scrape, table_name)
 
             if not has_address:
@@ -1162,6 +1251,17 @@ def get_data(page, database, state_name):
                 )
 
         except Exception as scrape_ex:
+            try:
+                diagnostic_text = page.locator("#right_content").inner_text().strip()
+                if diagnostic_text:
+                    print_log(
+                        "Notice page diagnostic: {}".format(
+                            re.sub(r"\s+", " ", diagnostic_text)[:500]
+                        ),
+                        True,
+                    )
+            except Exception:
+                pass
             print_log(f"Failed to scrape notice content at {page.url}: {scrape_ex}", True)
 
     return page, web_scrape
@@ -1171,7 +1271,7 @@ def get_all_pages(
     page, pagers, database, state, site_url=None, return_failures=False
 ):
     if site_url is None:
-        site_url = "https://www.ncnotices.com/" if state == "NC" else "https://www.georgiapublicnotice.com/"
+        site_url = get_state_config(state).source_url
     print_log("Page Loaded...")
     all_records = []
     failures = []
@@ -1245,7 +1345,7 @@ def get_all_pages(
                         and hasattr(database, "get_pub_record")
                     ):
                         existing = database.get_pub_record(
-                            "NcPub" if state == "NC" else "GaPub", notice_id
+                            notice_table_for_state(state), notice_id
                         )
                         if existing and existing.get("Notice"):
                             all_records.append(existing)
@@ -1453,10 +1553,11 @@ def get_propstream_address_details(prop_id, propstream_session):
 def _notice_table_for_propstream(table_name, db_info):
     table_lower = str(table_name).lower()
     state = str(db_info.get("State", "")).upper()
-    if table_lower.endswith("_ga") or state == "GA":
-        return "GaPub"
-    if table_lower.endswith("_nc") or state == "NC":
-        return "NcPub"
+    if state:
+        return notice_table_for_state(state)
+    for code in ("GA", "NC", "FL", "NY", "NJ", "MD", "TX"):
+        if table_lower.endswith("_" + code.lower()):
+            return notice_table_for_state(code)
     raise ValueError("Cannot determine source notice table for {}".format(table_name))
 
 

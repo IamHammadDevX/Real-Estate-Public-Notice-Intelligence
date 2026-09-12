@@ -46,6 +46,18 @@ else
     echo "STATE_SKIP NC already complete"
 fi
 
+for state in FL NY NJ MD TX; do
+    marker="$(echo "$state" | tr '[:upper:]' '[:lower:]')"
+    if [[ ! -f "$STATE_DIR/$marker.complete" ]]; then
+        echo "STATE_START $state"
+        python -u multistate_scraper.py "$state"
+        touch "$STATE_DIR/$marker.complete"
+        echo "STATE_COMPLETE $state"
+    else
+        echo "STATE_SKIP $state already complete"
+    fi
+done
+
 echo "EXPORT_START"
 python -u export_pub_tables.py
 echo "EXPORT_COMPLETE"

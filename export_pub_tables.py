@@ -8,6 +8,7 @@ import re
 import zipfile
 from datetime import datetime
 from db_file import Mysql
+from state_config import NOTICE_TABLES
 from dotenv import load_dotenv
 
 try:
@@ -22,7 +23,7 @@ load_dotenv()
 OUTPUT_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), 'exports'))
 os.makedirs(OUTPUT_DIR, exist_ok=True)
 
-TABLES = ['GaPub', 'NcPub']
+TABLES = sorted(NOTICE_TABLES)
 EXCEL_ILLEGAL_CHARACTERS = re.compile(r"[\x00-\x08\x0B\x0C\x0E-\x1F]")
 
 
@@ -75,7 +76,7 @@ def export_xlsx(table_name, cols, rows):
 
 def create_zip(files):
     timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
-    zip_path = os.path.join(OUTPUT_DIR, f"GA_NC_records_{timestamp}.zip")
+    zip_path = os.path.join(OUTPUT_DIR, f"foreclosure_records_{timestamp}.zip")
     with zipfile.ZipFile(zip_path, 'w', zipfile.ZIP_DEFLATED) as zf:
         for f in files:
             if f and os.path.exists(f):

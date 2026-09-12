@@ -11,7 +11,7 @@ systemctl show foreclosure-scraper.service \
 
 echo
 echo "=== COMPLETION MARKERS ==="
-for state in ga nc full_scrape; do
+for state in ga nc fl ny nj md tx full_scrape; do
     if [[ -f "$PROJECT_DIR/state/$state.complete" ]]; then
         echo "$state: complete"
     else
